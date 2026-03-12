@@ -6,32 +6,23 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"time"
 )
 
-const (
-	port      = "3000"               // Use Render's PORT environment if needed
-	filePath  = "./public/index.html"
-	precheckPath = "/precheck"
-)
+const precheckPath = "/precheck"
+const filePath = "./public/index.html"
 
 func precheckHandler(w http.ResponseWriter, r *http.Request) {
-	// Get request context (canceled if client disconnects)
 	ctx := r.Context()
-
-	// Channel to signal done
 	done := make(chan bool)
 
 	go func() {
-		// Wait 1 second
 		time.Sleep(1 * time.Second)
 		select {
 		case <-ctx.Done():
-			// Client disconnected before 1 second
-			// Note: nothing sent yet
 			return
 		default:
-			// Serve the page
 			data, err := ioutil.ReadFile(filePath)
 			if err != nil {
 				http.Error(w, "Error loading page", http.StatusInternalServerError)
@@ -47,19 +38,23 @@ func precheckHandler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case <-ctx.Done():
-		// Client disconnected early → send 204
 		log.Println("Client disconnected early — 204 sent")
 		done <- true
 	case <-done:
-		// Page served
 		log.Println("Precheck page served")
 	}
 }
 
 func main() {
+	// Use PORT environment variable from Render
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
 	http.HandleFunc(precheckPath, precheckHandler)
 
-	// Optional: cron-like ping to keep server alive every 14s
+	// Cron ping to keep server alive every 14s
 	go func() {
 		for {
 			time.Sleep(14 * time.Second)
