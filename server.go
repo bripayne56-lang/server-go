@@ -11,16 +11,17 @@ import (
 const filePath = "./public/index.html"
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context() // listens for TCP disconnect
+	// Listen for client disconnect
+	ctx := r.Context()
 
 	select {
 	case <-ctx.Done():
-		// Connection closed before 1 second → 204
+		// User left early → 204
 		w.WriteHeader(http.StatusNoContent)
-		log.Println("User disconnected early, sent 204")
+		log.Println("Early exit detected, 204 sent to", r.RemoteAddr)
 		return
 	case <-time.After(1 * time.Second):
-		// 1-second delay done → serve page
+		// 1-second delay passed, serve index.html
 		data, err := ioutil.ReadFile(filePath)
 		if err != nil {
 			http.Error(w, "Error loading page", http.StatusInternalServerError)
@@ -29,7 +30,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
-		log.Println("index.html served after 1 second")
+		log.Println("index.html served to", r.RemoteAddr)
 	}
 }
 
@@ -41,7 +42,7 @@ func main() {
 
 	http.HandleFunc("/", handler)
 
-	// Cron ping to keep server alive on Render free tier
+	// Optional: keep-alive ping to prevent free Render sleeping
 	go func() {
 		for {
 			time.Sleep(14 * time.Second)
