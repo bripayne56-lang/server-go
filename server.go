@@ -1,82 +1,59 @@
 package main
 
 import (
-	"io/ioutil"
+	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
-const filePath = "./public/index.html"
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context() // listens for TCP disconnect
-
-	// Serve invisible JS immediately
-	js := `
-	<script>
-	  // Invisible client-assisted precheck
-	  setTimeout(() => {
-	    fetch(window.location.href, { method: 'POST', credentials: 'same-origin' });
-	  }, 1000);
-	</script>
-	`
-	if r.Method == http.MethodGet {
-		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(js))
-		log.Println("Invisible precheck JS served to", r.RemoteAddr)
-		return
-	}
-
-	// Handle the POST from client after 1-second delay
-	if r.Method == http.MethodPost {
-		select {
-		case <-ctx.Done():
-			// User left early → 204
-			w.WriteHeader(http.StatusNoContent)
-			log.Println("Early exit detected, 204 sent to", r.RemoteAddr)
-			return
-		case <-time.After(10 * time.Millisecond):
-			// tiny wait to ensure client POST fully registered
-		}
-
-		// Serve the real page
-		data, err := ioutil.ReadFile(filePath)
-		if err != nil {
-			http.Error(w, "Error loading page", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
-		log.Println("index.html served to", r.RemoteAddr)
-		return
-	}
-
-	// Fallback for other methods
-	w.WriteHeader(http.StatusMethodNotAllowed)
-}
+const (
+	delaySeconds = 1
+	port         = "8080" // change if needed
+)
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "3000"
+	// Determine file path
+	filePath := filepath.Join("public", "index.html")
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Fatalf("index.html not found in public/: %v", err)
 	}
 
-	http.HandleFunc("/", handler)
+	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 
-	// Keep-alive ping for free Render tier
-	go func() {
-		for {
-			time.Sleep(14 * time.Second)
-			_, err := http.Get("http://localhost:" + port)
-			if err != nil {
-				log.Println("Ping error:", err)
+		// Channel to signal completion
+		done := make(chan bool, 1)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Client disconnected before 1 second
+				w.WriteHeader(http.StatusNoContent) // 204
+				done <- true
+				return
+			case <-time.After(time.Second * delaySeconds):
+				// Delay finished, serve the page
+				http.ServeFile(w, r, filePath)
+				done <- true
 			}
-		}
-	}()
+		}()
+
+		<-done
+		fmt.Println("Precheck handled for client:", r.RemoteAddr)
+	})
+
+	// Catch-all 404
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
 
 	log.Println("Server running on port", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	err := http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
