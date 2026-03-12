@@ -8,41 +8,29 @@ import (
 	"time"
 )
 
-const (
-	precheckPath = "/precheck"
-	servePath    = "/serve"
-	filePath     = "./public/index.html"
-)
+const filePath = "./public/index.html"
 
-func precheckHandler(w http.ResponseWriter, r *http.Request) {
-	js := `
-		<script>
-			// Invisible precheck: wait 1s then request /serve
-			setTimeout(() => {
-				window.location.href = '/serve';
-			}, 1000);
-		</script>
-	`
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(js))
-	log.Println("Precheck JS served")
-}
+func handler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context() // listens for TCP disconnect
 
-func serveHandler(w http.ResponseWriter, r *http.Request) {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		http.Error(w, "Error loading page", http.StatusInternalServerError)
+	select {
+	case <-ctx.Done():
+		// Connection closed before 1 second → 204
+		w.WriteHeader(http.StatusNoContent)
+		log.Println("User disconnected early, sent 204")
 		return
+	case <-time.After(1 * time.Second):
+		// 1-second delay done → serve page
+		data, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			http.Error(w, "Error loading page", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		log.Println("Page served after 1 second")
 	}
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-	w.Write(data)
-	log.Println("index.html served")
-}
-
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	serveHandler(w, r)
 }
 
 func main() {
@@ -51,14 +39,18 @@ func main() {
 		port = "3000"
 	}
 
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc(precheckPath, precheckHandler)
-	http.HandleFunc(servePath, serveHandler)
+	http.HandleFunc("/", handler)
 
+	// Cron ping every 14s to keep server alive on Render
 	go func() {
 		for {
 			time.Sleep(14 * time.Second)
-			http.Get("http://localhost:" + port + precheckPath)
+			_, err := http.Get("http://localhost:" + port + "/")
+			if err != nil {
+				log.Println("Ping error:", err)
+				continue
+			}
+			log.Println("Server pinged to stay alive")
 		}
 	}()
 
