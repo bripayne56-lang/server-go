@@ -1,79 +1,82 @@
-// server.js — Render-ready 1-second invisible precheck + cron ping
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const { CronJob } = require('cron');
+package main
 
-const PORT = process.env.PORT || 3000;
-const FILE_PATH = path.join(__dirname, 'public', 'index.html');
+import (
+	"context"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"time"
+)
 
-// -------------------------
-// Cron job to keep server alive (ping /precheck every 14s)
-const backendUrl = `http://localhost:${PORT}/precheck`;
-const job = new CronJob('*/14 * * * * *', () => { // every 14 seconds
-  http.get(backendUrl, (res) => {
-    if (res.statusCode === 204) {
-      console.log('Server alive (status 204)');
-    } else {
-      console.error(`Ping returned status code: ${res.statusCode}`);
-    }
-  }).on('error', (err) => console.error('Ping error:', err.message));
-});
-job.start();
+const (
+	port      = "3000"               // Use Render's PORT environment if needed
+	filePath  = "./public/index.html"
+	precheckPath = "/precheck"
+)
 
-// -------------------------
-// Main server
-const server = http.createServer((req, res) => {
+func precheckHandler(w http.ResponseWriter, r *http.Request) {
+	// Get request context (canceled if client disconnects)
+	ctx := r.Context()
 
-  // Only handle /precheck
-  if (req.url.startsWith('/precheck')) {
-    let finished = false;
+	// Channel to signal done
+	done := make(chan bool)
 
-    // Detect client disconnect early
-    req.on('close', () => {
-      if (!finished) {
-        console.log('Client disconnected early — sending 204');
-        res.writeHead(204);
-        res.end();
-        finished = true;
-      }
-    });
+	go func() {
+		// Wait 1 second
+		time.Sleep(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			// Client disconnected before 1 second
+			// Note: nothing sent yet
+			return
+		default:
+			// Serve the page
+			data, err := ioutil.ReadFile(filePath)
+			if err != nil {
+				http.Error(w, "Error loading page", http.StatusInternalServerError)
+				done <- true
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			done <- true
+		}
+	}()
 
-    // 1-second invisible wait
-    setTimeout(() => {
-      if (finished) return; // client already gone
+	select {
+	case <-ctx.Done():
+		// Client disconnected early → send 204
+		log.Println("Client disconnected early — 204 sent")
+		done <- true
+	case <-done:
+		// Page served
+		log.Println("Precheck page served")
+	}
+}
 
-      // Serve the page only after 1 second
-      fs.readFile(FILE_PATH, (err, data) => {
-        if (err) {
-          res.writeHead(500);
-          res.end('Error loading page');
-          return;
-        }
+func main() {
+	http.HandleFunc(precheckPath, precheckHandler)
 
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(data);
-        finished = true;
+	// Optional: cron-like ping to keep server alive every 14s
+	go func() {
+		for {
+			time.Sleep(14 * time.Second)
+			resp, err := http.Get("http://localhost:" + port + precheckPath)
+			if err != nil {
+				log.Println("Ping error:", err)
+				continue
+			}
+			if resp.StatusCode == 204 {
+				log.Println("Server alive (204 ping)")
+			} else {
+				log.Println("Server alive (status code):", resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+	}()
 
-        const url = new URL(req.url, `http://${req.headers.host}`);
-        console.log(
-          'Precheck served page for:',
-          url.searchParams.get('lp') || 'no lp',
-          'User-Agent:',
-          req.headers['user-agent']
-        );
-      });
-    }, 1000);
-
-    return;
-  }
-
-  // Default 404 for other paths
-  res.writeHead(404);
-  res.end('Not Found');
-});
-
-// Start server
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+	log.Printf("Server running on port %s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
