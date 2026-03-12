@@ -15,12 +15,11 @@ const (
 )
 
 func precheckHandler(w http.ResponseWriter, r *http.Request) {
-	// Serve tiny invisible JS for precheck
 	js := `
 		<script>
 			// Invisible precheck: wait 1s then request /serve
 			setTimeout(() => {
-				fetch('/serve', {credentials: 'same-origin'});
+				window.location.href = '/serve';
 			}, 1000);
 		</script>
 	`
@@ -31,7 +30,6 @@ func precheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveHandler(w http.ResponseWriter, r *http.Request) {
-	// Serve index.html
 	data, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		http.Error(w, "Error loading page", http.StatusInternalServerError)
@@ -43,26 +41,24 @@ func serveHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("index.html served")
 }
 
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	serveHandler(w, r)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
 
+	http.HandleFunc("/", rootHandler)
 	http.HandleFunc(precheckPath, precheckHandler)
 	http.HandleFunc(servePath, serveHandler)
 
-	// Cron ping to keep server alive every 14 seconds
 	go func() {
 		for {
 			time.Sleep(14 * time.Second)
-			resp, err := http.Get("http://localhost:" + port + precheckPath)
-			if err != nil {
-				log.Println("Ping error:", err)
-				continue
-			}
-			resp.Body.Close()
-			log.Println("Server pinged to stay alive")
+			http.Get("http://localhost:" + port + precheckPath)
 		}
 	}()
 
