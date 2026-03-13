@@ -5,22 +5,44 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func main() {
-	// Get Render-assigned port
+	// Use Render or DO environment port
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080" // fallback for local testing
 	}
 
-	// Path to index.html
+	// Path to your index.html
 	filePath := filepath.Join("public", "index.html")
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Fatalf("index.html not found in public/: %v", err)
+	}
 
-	// Serve /precheck endpoint
+	// /precheck endpoint
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, filePath)
-		log.Println("Served index.html to", r.RemoteAddr)
+		ctx := r.Context()
+
+		done := make(chan bool, 1)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Client disconnected before 1 second
+				w.WriteHeader(http.StatusNoContent) // 204
+				done <- true
+				return
+			case <-time.After(1 * time.Second):
+				// Delay finished, serve the page
+				http.ServeFile(w, r, filePath)
+				done <- true
+			}
+		}()
+
+		<-done
+		log.Println("Precheck handled for client:", r.RemoteAddr)
 	})
 
 	// Default 404
