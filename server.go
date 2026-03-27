@@ -5,54 +5,56 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
+var (
+	clickCount = 0
+	clickLimit = 2 // CHANGE THIS
+	mutex      sync.Mutex
+)
+
 func main() {
-	// Use Render or DO environment port
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // fallback for local testing
+		port = "8080"
 	}
 
-	// Path to your index.html
 	filePath := filepath.Join("public", "index.html")
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		log.Fatalf("index.html not found in public/: %v", err)
-	}
 
-	// /precheck endpoint
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
+
+		// Block if limit reached
+		mutex.Lock()
+		if clickCount >= clickLimit {
+			mutex.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mutex.Unlock()
+
 		ctx := r.Context()
 
-		done := make(chan bool, 1)
+		select {
+		case <-ctx.Done():
+			// User left early
+			w.WriteHeader(http.StatusNoContent)
+			return
 
-		go func() {
-			select {
-			case <-ctx.Done():
-				// Client disconnected before 1 second
-				w.WriteHeader(http.StatusNoContent) // 204
-				done <- true
-				return
-			case <-time.After(1 * time.Second):
-				// Delay finished, serve the page
-				http.ServeFile(w, r, filePath)
-				done <- true
-			}
-		}()
+		case <-time.After(1 * time.Second):
+			// Count valid click
+			mutex.Lock()
+			clickCount++
+			current := clickCount
+			mutex.Unlock()
 
-		<-done
-		log.Println("Precheck handled for client:", r.RemoteAddr)
-	})
+			log.Println("Valid click:", current)
 
-	// Default 404
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
+			http.ServeFile(w, r, filePath)
+		}
 	})
 
 	log.Println("Server running on port", port)
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
+	http.ListenAndServe(":"+port, nil)
 }
