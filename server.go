@@ -11,7 +11,7 @@ import (
 
 var (
 	clickCount = 0
-	clickLimit = 2 // CHANGE THIS
+	clickLimit = 20000 // CHANGE THIS
 	mutex      sync.Mutex
 )
 
