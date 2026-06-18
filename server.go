@@ -1,4 +1,4 @@
-```go
+go
 package main
 
 import (
@@ -69,5 +69,5 @@ func main() {
 	log.Println("Server running on port", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
-```
+
 
