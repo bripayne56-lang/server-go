@@ -40,8 +40,8 @@ func main() {
 		// Lock counter safely
 		mu.Lock()
 
-		// Stop after 1,000 total valid clicks
-		if clickCount >= 1000 {
+		// Stop after 2 total valid clicks
+		if clickCount >= 2 {
 			mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return
