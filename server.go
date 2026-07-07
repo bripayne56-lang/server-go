@@ -31,6 +31,9 @@ func main() {
 	})
 
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
+		// Log every request that reaches this endpoint
+		log.Println("Received precheck request:", r.Method, r.URL.Path)
+
 		// Try to claim one of 50 concurrent slots
 		select {
 		case semaphore <- struct{}{}:
@@ -61,6 +64,7 @@ func main() {
 		// Serve page
 		select {
 		case <-r.Context().Done():
+			log.Println("Request cancelled before validation:", currentClick)
 			w.WriteHeader(http.StatusNoContent)
 			return
 
