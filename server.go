@@ -25,6 +25,11 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
+	// Health check for GCP Load Balancer
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
 		// Try to claim one of 50 concurrent slots
 		select {
@@ -68,5 +73,4 @@ func main() {
 	log.Println("Server running on port", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
-
 
