@@ -13,7 +13,7 @@ var (
 	clickCount int
 	mu         sync.Mutex
 
-	// Limits concurrent validation requests to 50
+	// Limits concurrent requests to 50
 	semaphore = make(chan struct{}, 50)
 )
 
@@ -25,6 +25,7 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
+	// Health check for GCP Load Balancer
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -32,11 +33,12 @@ func main() {
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("PRECHECK HIT")
 
+		// Prevent caching
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 
-		// Concurrency protection
+		// Try to claim one of 50 concurrent slots
 		select {
 		case semaphore <- struct{}{}:
 			defer func() { <-semaphore }()
@@ -46,20 +48,25 @@ func main() {
 			return
 		}
 
-		// Server-side validation timer
-		start := time.Now()
-
+		// Monitor request for 1 second
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
 		timeout := time.NewTimer(1 * time.Second)
 		defer timeout.Stop()
 
+		elapsed := 0
+
 		for {
 			select {
+			case <-r.Context().Done():
+				log.Println("Client disconnected at:", elapsed, "ms")
+				w.WriteHeader(http.StatusNoContent)
+				return
+
 			case <-ticker.C:
-				elapsed := time.Since(start).Milliseconds()
-				log.Println("Validation time:", elapsed, "ms")
+				elapsed += 100
+				log.Println("Request alive:", elapsed, "ms")
 
 			case <-timeout.C:
 				goto VALIDATE
@@ -68,15 +75,7 @@ func main() {
 
 	VALIDATE:
 
-		duration := time.Since(start).Milliseconds()
-
-		// Require full 1 second validation window
-		if duration < 1000 {
-			log.Println("Rejected: validation too short")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
+		// Count only after surviving 1 second
 		mu.Lock()
 
 		if clickCount >= 10 {
@@ -93,6 +92,7 @@ func main() {
 
 		log.Println("Valid click:", currentClick)
 
+		// Serve page
 		http.ServeFile(w, r, filePath)
 	})
 
