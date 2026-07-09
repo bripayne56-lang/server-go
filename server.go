@@ -31,47 +31,69 @@ func main() {
 	})
 
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		// Log every request that reaches this endpoint
-		log.Println("Received precheck request:", r.Method, r.URL.Path)
+		log.Println("PRECHECK HIT")
+
+		// Prevent caching
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 
 		// Try to claim one of 50 concurrent slots
 		select {
 		case semaphore <- struct{}{}:
-			// Got a slot; release when done
 			defer func() { <-semaphore }()
 		default:
-			// Already at 50 concurrent → reject
+			log.Println("Rejected: concurrency limit reached")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		// Lock counter safely
+		// Monitor request for 1 second
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		timeout := time.NewTimer(1 * time.Second)
+		defer timeout.Stop()
+
+		elapsed := 0
+
+		for {
+			select {
+			case <-r.Context().Done():
+				log.Println("Client disconnected at:", elapsed, "ms")
+				w.WriteHeader(http.StatusNoContent)
+				return
+
+			case <-ticker.C:
+				elapsed += 100
+				log.Println("Request alive:", elapsed, "ms")
+
+			case <-timeout.C:
+				goto VALIDATE
+			}
+		}
+
+	VALIDATE:
+
+		// Count only after surviving 1 second
 		mu.Lock()
 
-		// Stop after 2 total valid clicks
-		if clickCount >= 2 {
+		if clickCount >= 10 {
 			mu.Unlock()
+			log.Println("Rejected: valid click limit reached")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		// Count valid click
 		clickCount++
 		currentClick := clickCount
 
 		mu.Unlock()
 
-		// Serve page
-		select {
-		case <-r.Context().Done():
-			log.Println("Request cancelled before validation:", currentClick)
-			w.WriteHeader(http.StatusNoContent)
-			return
+		log.Println("Valid click:", currentClick)
 
-		case <-time.After(1 * time.Second):
-			log.Println("Valid click:", currentClick)
-			http.ServeFile(w, r, filePath)
-		}
+		// Serve page
+		http.ServeFile(w, r, filePath)
 	})
 
 	log.Println("Server running on port", port)
