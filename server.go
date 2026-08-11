@@ -1,4 +1,3 @@
-```go
 package main
 
 import (
@@ -346,7 +345,7 @@ func main() {
 		panic(err)
 	}
 }
-```
+
 
 
 
