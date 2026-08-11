@@ -1,102 +1,326 @@
 package main
 
 import (
-	"log"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+const (
+	validationTime     = 1 * time.Second
+	validClickLimit    = 10
+	maxConcurrentWaits = 50
 )
 
 var (
-	clickCount int
-	mu         sync.Mutex
+	validClicks int
+	mu          sync.Mutex
 
-	// Limits concurrent requests to 50
-	semaphore = make(chan struct{}, 50)
+	waitSemaphore = make(chan struct{}, maxConcurrentWaits)
+
+	// Change this to your own long random secret.
+	secretKey = []byte("change-this-to-a-long-random-secret")
 )
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type validationResponse struct {
+	Status    string `json:"status"`
+	Signature string `json:"signature"`
+}
+
+func createToken() string {
+	b := make([]byte, 32)
+
+	_, _ = rand.Read(b)
+
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func createSignature(token string) string {
+	hash := sha256.Sum256(
+		append(secretKey, []byte(token)...),
+	)
+
+	return base64.RawURLEncoding.EncodeToString(
+		hash[:],
+	)
+}
+
+func verifySignature(token string, signature string) bool {
+	expected := createSignature(token)
+
+	if len(expected) != len(signature) {
+		return false
 	}
 
-	filePath := filepath.Join("public", "index.html")
+	return subtle.ConstantTimeCompare(
+		[]byte(expected),
+		[]byte(signature),
+	) == 1
+}
 
-	// Health check for GCP Load Balancer
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+func precheck(w http.ResponseWriter, r *http.Request) {
+	token := createToken()
 
-	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("PRECHECK HIT")
+	w.Header().Set(
+		"Content-Type",
+		"text/html",
+	)
 
-		// Prevent caching
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
+	fmt.Fprintf(w, `
+<!DOCTYPE html>
+<html>
+<head></head>
 
-		// Try to claim one of 50 concurrent slots
-		select {
-		case semaphore <- struct{}{}:
-			defer func() { <-semaphore }()
-		default:
-			log.Println("Rejected: concurrency limit reached")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+<body>
 
-		// Monitor request for 1 second
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
+<script>
 
-		timeout := time.NewTimer(1 * time.Second)
-		defer timeout.Stop()
+const token = "%s";
 
-		elapsed := 0
+let validationComplete = false;
+
+const wsProtocol =
+	window.location.protocol === "https:"
+		? "wss://"
+		: "ws://";
+
+const ws = new WebSocket(
+	wsProtocol +
+	window.location.host +
+	"/ws?token=" +
+	encodeURIComponent(token)
+);
+
+ws.onmessage = function(event) {
+
+	const data = JSON.parse(event.data);
+
+	if(data.status === "valid") {
+
+		validationComplete = true;
+
+		window.location =
+			"/?token=" +
+			encodeURIComponent(token) +
+			"&signature=" +
+			encodeURIComponent(data.signature);
+
+	}
+
+};
+
+window.addEventListener("beforeunload", function() {
+
+	if(!validationComplete) {
+
+		navigator.sendBeacon(
+			"/cancel?token=" +
+			encodeURIComponent(token)
+		);
+
+	}
+
+});
+
+</script>
+
+</body>
+</html>
+`, token)
+}
+
+func cancelHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+
+	if token == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	select {
+
+	case waitSemaphore <- struct{}{}:
+
+		defer func() {
+			<-waitSemaphore
+		}()
+
+	default:
+
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+
+	if token == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(
+		w,
+		r,
+		nil,
+	)
+
+	if err != nil {
+		return
+	}
+
+	defer conn.Close()
+
+	disconnected := make(chan struct{})
+
+	go func() {
+
+		defer close(disconnected)
 
 		for {
-			select {
-			case <-r.Context().Done():
-				log.Println("Client disconnected at:", elapsed, "ms")
-				w.WriteHeader(http.StatusNoContent)
+
+			_, _, err := conn.ReadMessage()
+
+			if err != nil {
 				return
-
-			case <-ticker.C:
-				elapsed += 100
-				log.Println("Request alive:", elapsed, "ms")
-
-			case <-timeout.C:
-				goto VALIDATE
 			}
 		}
 
-	VALIDATE:
+	}()
 
-		// Count only after surviving 1 second
+	timer := time.NewTimer(
+		validationTime,
+	)
+
+	defer timer.Stop()
+
+	select {
+
+	case <-timer.C:
+
 		mu.Lock()
 
-		if clickCount >= 10 {
+		if validClicks >= validClickLimit {
+
 			mu.Unlock()
-			log.Println("Rejected: valid click limit reached")
-			w.WriteHeader(http.StatusNoContent)
+
 			return
 		}
 
-		clickCount++
-		currentClick := clickCount
+		validClicks++
 
 		mu.Unlock()
 
-		log.Println("Valid click:", currentClick)
+		signature := createSignature(token)
 
-		// Serve page
-		http.ServeFile(w, r, filePath)
-	})
+		response := validationResponse{
+			Status:    "valid",
+			Signature: signature,
+		}
 
-	log.Println("Server running on port", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+		message, err := json.Marshal(
+			response,
+		)
+
+		if err != nil {
+			return
+		}
+
+		_ = conn.WriteMessage(
+			websocket.TextMessage,
+			message,
+		)
+
+	case <-disconnected:
+
+		return
+	}
 }
+
+func landing(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+
+	signature := r.URL.Query().Get("signature")
+
+	if token == "" ||
+		signature == "" ||
+		!verifySignature(token, signature) {
+
+		w.WriteHeader(
+			http.StatusNoContent,
+		)
+
+		return
+	}
+
+	w.Header().Set(
+		"Content-Type",
+		"text/html",
+	)
+
+	fmt.Fprint(w, `
+<!DOCTYPE html>
+<html>
+<body>
+
+<h1>Landing Page</h1>
+
+</body>
+</html>
+`)
+}
+
+func main() {
+	http.HandleFunc(
+		"/precheck",
+		precheck,
+	)
+
+	http.HandleFunc(
+		"/ws",
+		wsHandler,
+	)
+
+	http.HandleFunc(
+		"/cancel",
+		cancelHandler,
+	)
+
+	http.HandleFunc(
+		"/",
+		landing,
+	)
+
+	fmt.Println(
+		"Server running on :8080",
+	)
+
+	err := http.ListenAndServe(
+		":8080",
+		nil,
+	)
+
+	if err != nil {
+		panic(err)
+	}
+}
+
+
 
