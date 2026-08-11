@@ -32,7 +32,6 @@ var (
 
 	waitSemaphore = make(chan struct{}, maxConcurrentWaits)
 
-	// Change this to your own long random secret.
 	secretKey = []byte("change-this-to-a-long-random-secret")
 )
 
@@ -79,7 +78,6 @@ func verifySignature(token string, signature string) bool {
 }
 
 func precheck(w http.ResponseWriter, r *http.Request) {
-
 	token := createToken()
 
 	mu.Lock()
@@ -118,7 +116,6 @@ const ws = new WebSocket(
 	encodeURIComponent(token)
 );
 
-
 ws.onmessage = function(event) {
 
 	const data = JSON.parse(event.data);
@@ -136,7 +133,6 @@ ws.onmessage = function(event) {
 	}
 
 };
-
 
 window.addEventListener("beforeunload", function() {
 
@@ -159,33 +155,25 @@ window.addEventListener("beforeunload", function() {
 }
 
 func cancelHandler(w http.ResponseWriter, r *http.Request) {
-
 	token := r.URL.Query().Get("token")
 
 	if token == "" {
-
 		w.WriteHeader(http.StatusNoContent)
-
 		return
 	}
-
 
 	mu.Lock()
 
 	if t, ok := tokens[token]; ok {
-
 		t.Cancelled = true
-
 	}
 
 	mu.Unlock()
-
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-
 	select {
 
 	case waitSemaphore <- struct{}{}:
@@ -201,16 +189,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-
 	token := r.URL.Query().Get("token")
 
 	if token == "" {
-
 		w.WriteHeader(http.StatusNoContent)
-
 		return
 	}
-
 
 	mu.Lock()
 
@@ -218,14 +202,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Unlock()
 
-
 	if !exists {
-
 		w.WriteHeader(http.StatusNoContent)
-
 		return
 	}
-
 
 	conn, err := upgrader.Upgrade(
 		w,
@@ -239,7 +219,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	defer conn.Close()
 
-
 	disconnected := make(chan struct{})
 
 	go func() {
@@ -251,19 +230,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			_, _, err := conn.ReadMessage()
 
 			if err != nil {
-
 				return
 			}
 		}
 	}()
-
 
 	timer := time.NewTimer(
 		validationTime,
 	)
 
 	defer timer.Stop()
-
 
 	select {
 
@@ -280,7 +256,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-
 		if validClicks >= validClickLimit {
 
 			mu.Unlock()
@@ -288,20 +263,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-
 		validClicks++
 
 		mu.Unlock()
 
-
 		signature := createSignature(token)
-
 
 		response := validationResponse{
 			Status:    "valid",
 			Signature: signature,
 		}
-
 
 		message, err := json.Marshal(
 			response,
@@ -311,21 +282,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-
 		_ = conn.WriteMessage(
 			websocket.TextMessage,
 			message,
 		)
-
 
 	case <-disconnected:
 
 		mu.Lock()
 
 		if t, exists := tokens[token]; exists {
-
 			t.Cancelled = true
-
 		}
 
 		mu.Unlock()
@@ -334,12 +301,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func landing(w http.ResponseWriter, r *http.Request) {
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
 
+func landing(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 
 	signature := r.URL.Query().Get("signature")
-
 
 	if token == "" ||
 		signature == "" ||
@@ -352,7 +321,6 @@ func landing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-
 	mu.Lock()
 
 	t, exists := tokens[token]
@@ -361,9 +329,7 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 	mu.Unlock()
 
-
 	if !valid {
-
 		w.WriteHeader(
 			http.StatusNoContent,
 		)
@@ -371,12 +337,10 @@ func landing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-
 	w.Header().Set(
 		"Content-Type",
 		"text/html",
 	)
-
 
 	fmt.Fprint(w, `
 <!DOCTYPE html>
@@ -391,35 +355,34 @@ func landing(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	http.HandleFunc(
 		"/precheck",
 		precheck,
 	)
-
 
 	http.HandleFunc(
 		"/ws",
 		wsHandler,
 	)
 
-
 	http.HandleFunc(
 		"/cancel",
 		cancelHandler,
 	)
 
+	http.HandleFunc(
+		"/health",
+		healthHandler,
+	)
 
 	http.HandleFunc(
 		"/",
 		landing,
 	)
 
-
 	fmt.Println(
 		"Server running on :8080",
 	)
-
 
 	err := http.ListenAndServe(
 		":8080",
@@ -427,9 +390,9 @@ func main() {
 	)
 
 	if err != nil {
-
 		panic(err)
 	}
 }
+
 
 
