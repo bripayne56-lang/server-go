@@ -1,3 +1,4 @@
+```go
 package main
 
 import (
@@ -59,9 +60,7 @@ func createSignature(token string) string {
 		append(secretKey, []byte(token)...),
 	)
 
-	return base64.RawURLEncoding.EncodeToString(
-		hash[:],
-	)
+	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
 func verifySignature(token string, signature string) bool {
@@ -81,21 +80,15 @@ func precheck(w http.ResponseWriter, r *http.Request) {
 	token := createToken()
 
 	mu.Lock()
-
 	tokens[token] = &Token{}
-
 	mu.Unlock()
 
-	w.Header().Set(
-		"Content-Type",
-		"text/html",
-	)
+	w.Header().Set("Content-Type", "text/html")
 
 	fmt.Fprintf(w, `
 <!DOCTYPE html>
 <html>
 <head></head>
-
 <body>
 
 <script>
@@ -120,7 +113,7 @@ ws.onmessage = function(event) {
 
 	const data = JSON.parse(event.data);
 
-	if(data.status === "valid") {
+	if (data.status === "valid") {
 
 		validationComplete = true;
 
@@ -129,23 +122,8 @@ ws.onmessage = function(event) {
 			encodeURIComponent(token) +
 			"&signature=" +
 			encodeURIComponent(data.signature);
-
 	}
-
 };
-
-window.addEventListener("beforeunload", function() {
-
-	if(!validationComplete) {
-
-		navigator.sendBeacon(
-			"/cancel?token=" +
-			encodeURIComponent(token)
-		);
-
-	}
-
-});
 
 </script>
 
@@ -164,7 +142,7 @@ func cancelHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 
-	if t, ok := tokens[token]; ok {
+	if t, exists := tokens[token]; exists {
 		t.Cancelled = true
 	}
 
@@ -174,6 +152,7 @@ func cancelHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+
 	select {
 
 	case waitSemaphore <- struct{}{}:
@@ -185,7 +164,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 
 		w.WriteHeader(http.StatusNoContent)
-
 		return
 	}
 
@@ -207,11 +185,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(
-		w,
-		r,
-		nil,
-	)
+	conn, err := upgrader.Upgrade(w, r, nil)
 
 	if err != nil {
 		return
@@ -233,15 +207,29 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
 	}()
 
-	timer := time.NewTimer(
-		validationTime,
-	)
+	timer := time.NewTimer(validationTime)
 
 	defer timer.Stop()
 
 	select {
+
+	case <-disconnected:
+
+		// WebSocket closed before validation completed.
+		// Mark this token cancelled immediately.
+
+		mu.Lock()
+
+		if t, exists := tokens[token]; exists {
+			t.Cancelled = true
+		}
+
+		mu.Unlock()
+
+		return
 
 	case <-timer.C:
 
@@ -250,16 +238,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		t, exists := tokens[token]
 
 		if !exists || t.Cancelled {
-
 			mu.Unlock()
-
 			return
 		}
 
 		if validClicks >= validClickLimit {
-
 			mu.Unlock()
-
 			return
 		}
 
@@ -274,9 +258,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			Signature: signature,
 		}
 
-		message, err := json.Marshal(
-			response,
-		)
+		message, err := json.Marshal(response)
 
 		if err != nil {
 			return
@@ -286,38 +268,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			websocket.TextMessage,
 			message,
 		)
-
-	case <-disconnected:
-
-		mu.Lock()
-
-		if t, exists := tokens[token]; exists {
-			t.Cancelled = true
-		}
-
-		mu.Unlock()
-
-		return
 	}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-}
-
 func landing(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
 
+	token := r.URL.Query().Get("token")
 	signature := r.URL.Query().Get("signature")
 
 	if token == "" ||
 		signature == "" ||
 		!verifySignature(token, signature) {
 
-		w.WriteHeader(
-			http.StatusNoContent,
-		)
-
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -330,17 +293,11 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if !valid {
-		w.WriteHeader(
-			http.StatusNoContent,
-		)
-
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	w.Header().Set(
-		"Content-Type",
-		"text/html",
-	)
+	w.Header().Set("Content-Type", "text/html")
 
 	fmt.Fprint(w, `
 <!DOCTYPE html>
@@ -355,6 +312,7 @@ func landing(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+
 	http.HandleFunc(
 		"/precheck",
 		precheck,
@@ -368,11 +326,6 @@ func main() {
 	http.HandleFunc(
 		"/cancel",
 		cancelHandler,
-	)
-
-	http.HandleFunc(
-		"/health",
-		healthHandler,
 	)
 
 	http.HandleFunc(
@@ -393,6 +346,8 @@ func main() {
 		panic(err)
 	}
 }
+```
+
 
 
 
