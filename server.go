@@ -53,70 +53,81 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("PAGE REQUEST received")
 
-	// Start the 1-second validation timer.
+	// Wait one second before serving the page.
 	timer := time.NewTimer(validationTime)
 
 	defer timer.Stop()
 
 	select {
 
-	// -----------------------------------------------------
-	// BROWSER CANCELLED THE REQUEST
-	// -----------------------------------------------------
+	case <-timer.C:
+
+		// Validation period completed.
 
 	case <-r.Context().Done():
 
-		log.Println("REQUEST CANCELLED - invalid click")
+		// The request ended before validation completed.
+		log.Println("REQUEST ENDED BEFORE VALIDATION - 204")
 
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
 
 	// -----------------------------------------------------
-	// 1 SECOND COMPLETED
+	// CHECK VALID CLICK LIMIT
 	// -----------------------------------------------------
 
-	case <-timer.C:
+	mu.Lock()
 
-		mu.Lock()
-
-		// Check the global valid-click limit.
-		if validClicks >= validClickLimit {
-
-			mu.Unlock()
-
-			log.Println("VALID CLICK LIMIT REACHED - 204")
-
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// Count this as a valid click.
-		validClicks++
-
-		currentValidClicks := validClicks
+	if validClicks >= validClickLimit {
 
 		mu.Unlock()
 
-		log.Printf(
-			"VALID CLICK: %d/%d",
-			currentValidClicks,
-			validClickLimit,
-		)
+		log.Println("VALID CLICK LIMIT REACHED - 204")
+
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
-	// ---------------------------------------------------------
+	mu.Unlock()
+
+	// -----------------------------------------------------
 	// SERVE THE REAL PAGE
-	// ---------------------------------------------------------
+	// -----------------------------------------------------
 
-	w.Header().Set(
-		"Cache-Control",
-		"public, max-age=31536000",
-	)
+	log.Println("VALIDATION COMPLETE - SERVING INDEX")
 
-	http.ServeFile(
+	err := http.ServeFile(
 		w,
 		r,
 		"public/index.html",
+	)
+
+	if err != nil {
+		log.Printf(
+			"ERROR SERVING INDEX: %v",
+			err,
+		)
+
+		return
+	}
+
+	// -----------------------------------------------------
+	// COUNT VALID CLICK
+	// -----------------------------------------------------
+
+	mu.Lock()
+
+	validClicks++
+
+	currentValidClicks := validClicks
+
+	mu.Unlock()
+
+	log.Printf(
+		"VALID CLICK: %d/%d",
+		currentValidClicks,
+		validClickLimit,
 	)
 }
 
