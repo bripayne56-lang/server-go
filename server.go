@@ -36,6 +36,7 @@ func health(w http.ResponseWriter, r *http.Request) {
 
 func landing(w http.ResponseWriter, r *http.Request) {
 
+	// Limit simultaneous validation waits.
 	select {
 
 	case waitSemaphore <- struct{}{}:
@@ -52,24 +53,11 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("PAGE REQUEST received")
 
-	// Wait one second before serving the page.
-	timer := time.NewTimer(validationTime)
+	// -----------------------------------------------------
+	// ONE-SECOND VALIDATION GATE
+	// -----------------------------------------------------
 
-	defer timer.Stop()
-
-	select {
-
-	case <-timer.C:
-
-		// One-second validation completed.
-
-	case <-r.Context().Done():
-
-		log.Println("REQUEST ENDED BEFORE VALIDATION - 204")
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	time.Sleep(validationTime)
 
 	// -----------------------------------------------------
 	// CHECK VALID CLICK LIMIT
@@ -109,7 +97,7 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// -----------------------------------------------------
-	// SERVE THE REAL PAGE
+	// SERVE YOUR EXISTING PAGE
 	// -----------------------------------------------------
 
 	log.Println("VALIDATION COMPLETE - SERVING INDEX")
@@ -168,6 +156,4 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
-
 
