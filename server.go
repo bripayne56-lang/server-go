@@ -90,6 +90,25 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	// -----------------------------------------------------
+	// DISABLE BROWSER CACHING
+	// -----------------------------------------------------
+
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+
+	w.Header().Set(
+		"Pragma",
+		"no-cache",
+	)
+
+	w.Header().Set(
+		"Expires",
+		"0",
+	)
+
+	// -----------------------------------------------------
 	// SERVE THE REAL PAGE
 	// -----------------------------------------------------
 
@@ -149,7 +168,6 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
 
 
 
