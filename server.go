@@ -1,30 +1,39 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
 
 const (
-	validationTime     = 1 * time.Second
-	validClickLimit    = 10
+	// Every accepted request waits this long before the page is served.
+	validationTime = 1 * time.Second
+
+	// Maximum number of valid clicks that can ever be counted
+	// during the lifetime of this server process.
+	validClickLimit = 10
+
+	// Maximum number of requests allowed to wait during validation
+	// at the same time.
 	maxConcurrentWaits = 500
 )
 
 var (
 	mu sync.Mutex
 
-	// Completed valid clicks.
+	// Successfully completed valid clicks.
 	validClicks int
 
-	// Click slots that passed validation but have not
-	// finished ServeFile() yet.
+	// Requests that passed the validation delay and have reserved
+	// one of the 10 available click slots, but have not yet
+	// finished serving index.html.
 	reservedClicks int
 
-	// Limits simultaneous validation requests.
+	// Prevents unlimited numbers of requests from simultaneously
+	// sitting in the 1-second validation period.
 	waitSemaphore = make(chan struct{}, maxConcurrentWaits)
 )
 
@@ -33,34 +42,9 @@ var (
 // ---------------------------------------------------------
 
 func health(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-}
-
-// ---------------------------------------------------------
-// INTERNAL VALIDATION
-// ---------------------------------------------------------
-
-func validate(w http.ResponseWriter, r *http.Request) {
-
-	log.Println("VALIDATION POST received")
-
-	timer := time.NewTimer(validationTime)
-	defer timer.Stop()
-
-	select {
-
-	case <-timer.C:
-
-		log.Println("VALIDATION PASS")
-
-		w.WriteHeader(http.StatusOK)
-
-	case <-r.Context().Done():
-
-		log.Println("VALIDATION CANCELLED")
-
-		return
-	}
+	_, _ = w.Write([]byte("OK"))
 }
 
 // ---------------------------------------------------------
@@ -69,8 +53,15 @@ func validate(w http.ResponseWriter, r *http.Request) {
 
 func landing(w http.ResponseWriter, r *http.Request) {
 
+	start := time.Now()
+
+	log.Printf(
+		"PAGE REQUEST START: %s",
+		start.Format(time.RFC3339Nano),
+	)
+
 	// -----------------------------------------------------
-	// LIMIT SIMULTANEOUS VALIDATIONS
+	// LIMIT SIMULTANEOUS VALIDATION REQUESTS
 	// -----------------------------------------------------
 
 	select {
@@ -89,56 +80,42 @@ func landing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("PAGE REQUEST received")
-
 	// -----------------------------------------------------
-	// BLOCKING SERVER-SIDE POST
+	// ONE-SECOND SERVER-SIDE DELAY
 	// -----------------------------------------------------
 
-	validationReq, err := http.NewRequestWithContext(
-		r.Context(),
-		http.MethodPost,
-		"http://127.0.0.1:8080/validate",
-		nil,
-	)
+	log.Println("STARTING 1 SECOND VALIDATION")
 
-	if err != nil {
+	timer := time.NewTimer(validationTime)
 
-		log.Println("VALIDATION REQUEST ERROR")
+	select {
 
-		w.WriteHeader(http.StatusNoContent)
+	case <-timer.C:
+
+		log.Printf(
+			"VALIDATION COMPLETE: elapsed=%v",
+			time.Since(start),
+		)
+
+	case <-r.Context().Done():
+
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		log.Printf(
+			"REQUEST CANCELLED DURING VALIDATION: elapsed=%v",
+			time.Since(start),
+		)
+
 		return
 	}
 
-	log.Println("STARTING BLOCKING VALIDATION POST")
-
-	validationResp, err := http.DefaultClient.Do(validationReq)
-
-	if err != nil {
-
-		log.Println("VALIDATION POST FAILED")
-
-		return
-	}
-
-	defer validationResp.Body.Close()
-
 	// -----------------------------------------------------
-	// VALIDATION VERDICT
-	// -----------------------------------------------------
-
-	if validationResp.StatusCode != http.StatusOK {
-
-		log.Println("VALIDATION FAILED - 204")
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	log.Println("VALIDATION PASSED")
-
-	// -----------------------------------------------------
-	// RESERVE VALID CLICK SLOT
+	// RESERVE ONE VALID CLICK SLOT
 	// -----------------------------------------------------
 
 	mu.Lock()
@@ -147,7 +124,11 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 		mu.Unlock()
 
-		log.Println("VALID CLICK LIMIT REACHED - 204")
+		log.Printf(
+			"VALID CLICK LIMIT REACHED: valid=%d reserved=%d - 204",
+			validClicks,
+			reservedClicks,
+		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -166,7 +147,7 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// -----------------------------------------------------
-	// RELEASE RESERVATION IF NOT COMPLETED
+	// RELEASE RESERVATION IF REQUEST DOES NOT COMPLETE
 	// -----------------------------------------------------
 
 	counted := false
@@ -181,12 +162,14 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 			mu.Unlock()
 
-			log.Println("CLICK NOT COUNTED - RESERVATION RELEASED")
+			log.Println(
+				"CLICK NOT COUNTED - RESERVATION RELEASED",
+			)
 		}
 	}()
 
 	// -----------------------------------------------------
-	// RESPONSE HEADERS
+	// NO-CACHE HEADERS
 	// -----------------------------------------------------
 
 	w.Header().Set(
@@ -208,7 +191,10 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	// SERVE INDEX
 	// -----------------------------------------------------
 
-	log.Println("VALIDATION COMPLETE - SERVING INDEX")
+	log.Printf(
+		"VALIDATION COMPLETE - SERVING INDEX: elapsed=%v",
+		time.Since(start),
+	)
 
 	http.ServeFile(
 		w,
@@ -223,7 +209,6 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 
 	reservedClicks--
-
 	validClicks++
 
 	currentValidClicks := validClicks
@@ -233,9 +218,10 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	counted = true
 
 	log.Printf(
-		"VALID CLICK: %d/%d",
+		"VALID CLICK: %d/%d | total elapsed=%v",
 		currentValidClicks,
 		validClickLimit,
+		time.Since(start),
 	)
 }
 
@@ -245,25 +231,33 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-	http.HandleFunc(
-		"/health",
-		health,
-	)
+	// -----------------------------------------------------
+	// PORT
+	// -----------------------------------------------------
 
-	http.HandleFunc(
-		"/validate",
-		validate,
-	)
+	// Use the platform-provided PORT when available.
+	// Otherwise use 8080 locally.
+	port := os.Getenv("PORT")
 
-	http.HandleFunc(
-		"/",
-		landing,
-	)
+	if port == "" {
+		port = "8080"
+	}
 
-	fmt.Println("Server running on :8080")
+	// -----------------------------------------------------
+	// ROUTES
+	// -----------------------------------------------------
+
+	http.HandleFunc("/health", health)
+	http.HandleFunc("/", landing)
+
+	// -----------------------------------------------------
+	// SERVER
+	// -----------------------------------------------------
+
+	log.Printf("SERVER STARTING ON PORT %s", port)
 
 	err := http.ListenAndServe(
-		":8080",
+		":"+port,
 		nil,
 	)
 
@@ -271,3 +265,4 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
