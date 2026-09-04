@@ -1,3 +1,4 @@
+```go
 package main
 
 import (
@@ -52,6 +53,20 @@ func health(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------
 
 func landing(w http.ResponseWriter, r *http.Request) {
+
+	// -----------------------------------------------------
+	// NO-CACHE / NO-STORE HEADERS
+	// -----------------------------------------------------
+
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
+	)
+
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("Vary", "*")
 
 	start := time.Now()
 
@@ -169,25 +184,6 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// -----------------------------------------------------
-	// NO-CACHE HEADERS
-	// -----------------------------------------------------
-
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-
-	w.Header().Set(
-		"Pragma",
-		"no-cache",
-	)
-
-	w.Header().Set(
-		"Expires",
-		"0",
-	)
-
-	// -----------------------------------------------------
 	// SERVE INDEX
 	// -----------------------------------------------------
 
@@ -265,4 +261,6 @@ func main() {
 		log.Fatal(err)
 	}
 }
+```
+
 
