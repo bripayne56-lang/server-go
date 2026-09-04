@@ -1,3 +1,4 @@
+```go
 package main
 
 import (
@@ -42,7 +43,10 @@ var (
 // ---------------------------------------------------------
 
 func health(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 }
@@ -52,6 +56,8 @@ func health(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------
 
 func landing(w http.ResponseWriter, r *http.Request) {
+
+	start := time.Now()
 
 	// -----------------------------------------------------
 	// NO-CACHE / NO-STORE HEADERS
@@ -67,10 +73,15 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Surrogate-Control", "no-store")
 	w.Header().Set("Vary", "*")
 
-	start := time.Now()
+	// -----------------------------------------------------
+	// REQUEST LOGGING
+	// -----------------------------------------------------
 
 	log.Printf(
-		"PAGE REQUEST START: %s",
+		"PAGE REQUEST START: method=%s path=%s user-agent=%q time=%s",
+		r.Method,
+		r.URL.Path,
+		r.UserAgent(),
 		start.Format(time.RFC3339Nano),
 	)
 
@@ -88,7 +99,9 @@ func landing(w http.ResponseWriter, r *http.Request) {
 
 	default:
 
-		log.Println("VALIDATION CAPACITY REACHED - 204")
+		log.Println(
+			"VALIDATION CAPACITY REACHED - 204",
+		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -98,7 +111,9 @@ func landing(w http.ResponseWriter, r *http.Request) {
 	// ONE-SECOND SERVER-SIDE DELAY
 	// -----------------------------------------------------
 
-	log.Println("STARTING 1 SECOND VALIDATION")
+	log.Println(
+		"STARTING 1 SECOND VALIDATION",
+	)
 
 	timer := time.NewTimer(validationTime)
 
@@ -249,7 +264,10 @@ func main() {
 	// SERVER
 	// -----------------------------------------------------
 
-	log.Printf("SERVER STARTING ON PORT %s", port)
+	log.Printf(
+		"SERVER STARTING ON PORT %s",
+		port,
+	)
 
 	err := http.ListenAndServe(
 		":"+port,
@@ -260,5 +278,7 @@ func main() {
 		log.Fatal(err)
 	}
 }
+```
+
 
 
