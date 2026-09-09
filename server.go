@@ -27,8 +27,7 @@ var (
 	// Clicks that successfully completed validation.
 	validClicks int
 
-	// Clicks that have reserved a slot and are currently
-	// going through the 1-second validation.
+	// Clicks currently going through validation.
 	reservedClicks int
 
 	// Limits simultaneous validations.
@@ -56,12 +55,15 @@ func main() {
 	})
 
 	// PRECHECK
-	// This keeps your existing /precheck URL working.
+	// This is the public entry point.
+	// It performs the 1-second validation before
+	// sending the actual index.html.
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		serveLandingPage(w, r, filePath)
+		verifyHandler(w, r, filePath)
 	})
 
-	// VERIFICATION REQUEST
+	// VERIFY
+	// Kept available in case it is needed later.
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		verifyHandler(w, r, filePath)
 	})
@@ -90,6 +92,9 @@ func main() {
 }
 
 // SERVE LANDING PAGE
+// Used for "/".
+// This delays the page but does not count the visit
+// as one of the 10 valid clicks.
 func serveLandingPage(w http.ResponseWriter, r *http.Request, filePath string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -113,19 +118,25 @@ func serveLandingPage(w http.ResponseWriter, r *http.Request, filePath string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	// Invisible data is sent and flushed first.
+	// Invisible data is sent first.
 	_, _ = w.Write([]byte("<!-- waiting -->"))
 	flusher.Flush()
 
 	// Wait one second.
 	time.Sleep(validationTime)
 
-	// Send the actual index.html.
+	// Send the actual page.
 	_, _ = w.Write(page)
 	flusher.Flush()
 }
 
 // VERIFY HANDLER
+// Used by /precheck and /verify.
+//
+// Reserves one of the 10 lifetime slots,
+// waits one second,
+// checks whether the client stayed connected,
+// then counts the click and sends index.html.
 func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -186,12 +197,13 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 		mu.Unlock()
 	}()
 
-	// Send invisible data first and flush it.
+	// Send invisible data first.
+	// Nothing visual appears on the page.
 	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
 	flusher.Flush()
 
-	// Wait for the validation period while watching
-	// for the client disconnecting.
+	// Wait one second while watching for
+	// the client disconnecting.
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
@@ -211,7 +223,8 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 		return
 	}
 
-	// Count the click only after the full validation period.
+	// Count the click only after the full
+	// validation period has completed.
 	mu.Lock()
 	validClicks++
 
@@ -223,7 +236,7 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 
 	mu.Unlock()
 
-	// Send the actual index.html after validation.
+	// Send the actual page.
 	_, _ = w.Write(page)
 	flusher.Flush()
 }
@@ -245,7 +258,4 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
-
-
-
 
