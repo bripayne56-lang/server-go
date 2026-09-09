@@ -57,7 +57,7 @@ func main() {
 	// PRECHECK
 	// This is the public entry point.
 	// It performs the 1-second validation before
-	// sending the actual index.html.
+	// sending the user to the hidden gate.
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
 		verifyHandler(w, r, filePath)
 	})
@@ -66,6 +66,19 @@ func main() {
 	// Kept available in case it is needed later.
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		verifyHandler(w, r, filePath)
+	})
+
+	// GATE
+	// Holds the browser for another 1 second,
+	// then sends it to index.html.
+	http.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		gateHandler(w, r)
+	})
+
+	// INDEX.HTML
+	// Serves the actual landing page after /gate.
+	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
+		indexHandler(w, r, filePath)
 	})
 
 	// STATUS
@@ -136,7 +149,7 @@ func serveLandingPage(w http.ResponseWriter, r *http.Request, filePath string) {
 // Reserves one of the 10 lifetime slots,
 // waits one second,
 // checks whether the client stayed connected,
-// then counts the click and sends index.html.
+// then counts the click and sends the user to /gate.
 func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -216,8 +229,8 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 		// Validation completed.
 	}
 
-	// Read the actual index.html.
-	page, err := os.ReadFile(filePath)
+	// Read the actual index.html to make sure it exists.
+	_, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Println("Failed to read index.html:", err)
 		return
@@ -236,9 +249,67 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 
 	mu.Unlock()
 
-	// Send the actual page.
-	_, _ = w.Write(page)
+	// Send the browser to the gate.
+	_, _ = w.Write([]byte(`
+<script>
+	window.location.href = "/gate";
+</script>
+`))
 	flusher.Flush()
+}
+
+// GATE HANDLER
+// The browser reaches this after successful validation.
+// It waits one additional second before navigating
+// to the actual index.html page.
+func gateHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	w.WriteHeader(http.StatusOK)
+
+	// The page is visually blank.
+	// JavaScript waits one second before navigating.
+	_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<script>
+		setTimeout(function() {
+			window.location.href = "/index.html";
+		}, 1000);
+	</script>
+</head>
+<body></body>
+</html>`))
+}
+
+// INDEX.HTML
+// Serves the actual page after the gate.
+func indexHandler(w http.ResponseWriter, r *http.Request, filePath string) {
+	page, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Println("Failed to read index.html:", err)
+		http.Error(w, "Could not load page", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(page)
 }
 
 // SIMPLE INTEGER CONVERSION
@@ -258,4 +329,6 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
+
 
