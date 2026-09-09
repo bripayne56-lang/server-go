@@ -55,6 +55,12 @@ func main() {
 		serveLandingPage(w, r, filePath)
 	})
 
+	// PRECHECK
+	// This keeps your existing /precheck URL working.
+	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
+		serveLandingPage(w, r, filePath)
+	})
+
 	// VERIFICATION REQUEST
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		verifyHandler(w, r, filePath)
@@ -181,11 +187,10 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 	}()
 
 	// Send invisible data first and flush it.
-	// Nothing visually meaningful is displayed.
 	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
 	flusher.Flush()
 
-	// Wait for the validation period, while also watching
+	// Wait for the validation period while watching
 	// for the client disconnecting.
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
@@ -240,5 +245,7 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
+
 
 
