@@ -3,280 +3,251 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
 
 const (
-	// Every accepted request waits this long before the page is served.
+	// Every accepted request waits this long before completing.
 	validationTime = 1 * time.Second
 
-	// Maximum number of valid clicks that can ever be counted
+	// Maximum number of clicks that can ever be successfully completed
 	// during the lifetime of this server process.
 	validClickLimit = 10
 
-	// Maximum number of requests allowed to wait during validation
-	// at the same time.
-	maxConcurrentWaits = 500
+	// Maximum number of clicks allowed to be validating simultaneously.
+	maxConcurrentValidations = 500
 )
 
 var (
 	mu sync.Mutex
 
-	// Successfully completed valid clicks.
+	// Clicks that have successfully completed validation.
 	validClicks int
 
-	// Requests that passed the validation delay and have reserved
-	// one of the 10 available click slots, but have not yet
-	// finished serving index.html.
+	// Clicks that have claimed one of the 10 lifetime slots
+	// and are currently waiting through the validation period.
 	reservedClicks int
 
-	// Prevents unlimited numbers of requests from simultaneously
-	// sitting in the 1-second validation period.
-	waitSemaphore = make(chan struct{}, maxConcurrentWaits)
+	// Limits the number of requests simultaneously inside validation.
+	validationSemaphore = make(chan struct{}, maxConcurrentValidations)
 )
 
-// ---------------------------------------------------------
 // HEALTH CHECK
-// ---------------------------------------------------------
-
 func health(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 }
 
-// ---------------------------------------------------------
-// PAGE REQUEST
-// ---------------------------------------------------------
-
+// LANDING PAGE
 func landing(w http.ResponseWriter, r *http.Request) {
-
-	start := time.Now()
-
-	// -----------------------------------------------------
-	// NO-CACHE / NO-STORE HEADERS
-	// -----------------------------------------------------
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(
+			w,
+			"Streaming not supported by server configuration",
+			http.StatusInternalServerError,
+		)
+		return
+	}
 
 	w.Header().Set(
 		"Cache-Control",
-		"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
+		"no-store, no-cache, must-revalidate, max-age=0",
 	)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set("Surrogate-Control", "no-store")
-	w.Header().Set("Vary", "*")
+	// Send only invisible HTML data first.
+	// Nothing visible is displayed from this.
+	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
+	flusher.Flush()
 
-	// -----------------------------------------------------
-	// REQUEST LOGGING
-	// -----------------------------------------------------
+	// Wait 1 second before sending the actual landing page.
+	time.Sleep(validationTime)
 
-	log.Printf(
-		"PAGE REQUEST START: method=%s path=%s user-agent=%q time=%s",
-		r.Method,
-		r.URL.Path,
-		r.UserAgent(),
-		start.Format(time.RFC3339Nano),
-	)
+	// Send the visible landing page.
+	_, _ = w.Write([]byte(`
+<!doctype html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Landing Page</title>
+</head>
+<body>
+	<h1>Landing Page</h1>
+</body>
+</html>
+`))
 
-	// -----------------------------------------------------
-	// LIMIT SIMULTANEOUS VALIDATION REQUESTS
-	// -----------------------------------------------------
+	flusher.Flush()
+}
 
+// EXPLICIT USER ACTION / CLICK VALIDATION
+func action(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(
+			w,
+			"Streaming not supported by server configuration",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	// Limit the number of clicks validating at the same time.
 	select {
-
-	case waitSemaphore <- struct{}{}:
-
+	case validationSemaphore <- struct{}{}:
 		defer func() {
-			<-waitSemaphore
+			<-validationSemaphore
 		}()
 
 	default:
-
-		log.Println(
-			"VALIDATION CAPACITY REACHED - 204",
+		http.Error(
+			w,
+			"Server Busy: too many concurrent validations",
+			http.StatusServiceUnavailable,
 		)
-
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// -----------------------------------------------------
-	// ONE-SECOND SERVER-SIDE DELAY
-	// -----------------------------------------------------
-
-	log.Println(
-		"STARTING 1 SECOND VALIDATION",
-	)
-
-	timer := time.NewTimer(validationTime)
-
-	select {
-
-	case <-timer.C:
-
-		log.Printf(
-			"VALIDATION COMPLETE: elapsed=%v",
-			time.Since(start),
-		)
-
-	case <-r.Context().Done():
-
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
-		log.Printf(
-			"REQUEST CANCELLED DURING VALIDATION: elapsed=%v",
-			time.Since(start),
-		)
-
-		return
-	}
-
-	// -----------------------------------------------------
-	// RESERVE ONE VALID CLICK SLOT
-	// -----------------------------------------------------
-
+	// Reserve one of the 10 lifetime slots.
 	mu.Lock()
 
 	if validClicks+reservedClicks >= validClickLimit {
-
 		mu.Unlock()
 
-		log.Printf(
-			"VALID CLICK LIMIT REACHED: valid=%d reserved=%d - 204",
-			validClicks,
-			reservedClicks,
+		http.Error(
+			w,
+			"Click limit reached",
+			http.StatusTooManyRequests,
 		)
-
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	reservedClicks++
 
-	currentReserved := validClicks + reservedClicks
-
-	mu.Unlock()
-
 	log.Printf(
-		"VALID CLICK SLOT RESERVED: %d/%d",
-		currentReserved,
+		"[CLICK] Reserved slot: completed=%d reserved=%d limit=%d",
+		validClicks,
+		reservedClicks,
 		validClickLimit,
 	)
 
-	// -----------------------------------------------------
-	// RELEASE RESERVATION IF REQUEST DOES NOT COMPLETE
-	// -----------------------------------------------------
+	mu.Unlock()
 
-	counted := false
-
+	// Release the reservation when this request finishes.
 	defer func() {
-
-		if !counted {
-
-			mu.Lock()
-
-			reservedClicks--
-
-			mu.Unlock()
-
-			log.Println(
-				"CLICK NOT COUNTED - RESERVATION RELEASED",
-			)
-		}
+		mu.Lock()
+		reservedClicks--
+		mu.Unlock()
 	}()
 
-	// -----------------------------------------------------
-	// SERVE INDEX
-	// -----------------------------------------------------
-
-	log.Printf(
-		"VALIDATION COMPLETE - SERVING INDEX: elapsed=%v",
-		time.Since(start),
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
 	)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	http.ServeFile(
-		w,
-		r,
-		"public/index.html",
-	)
+	// Send only invisible HTML data before the delay.
+	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
+	flusher.Flush()
 
-	// -----------------------------------------------------
-	// FINALIZE VALID CLICK
-	// -----------------------------------------------------
+	// Wait 1 second.
+	time.Sleep(validationTime)
 
+	// Validation completed successfully.
 	mu.Lock()
-
-	reservedClicks--
 	validClicks++
 
-	currentValidClicks := validClicks
+	log.Printf(
+		"[CLICK] Completed: %d/%d (still validating: %d)",
+		validClicks,
+		validClickLimit,
+		reservedClicks-1,
+	)
 
 	mu.Unlock()
 
-	counted = true
+	// Send the visible result after the delay.
+	_, _ = w.Write([]byte(`
+<div>
+	Click successfully validated.
+</div>
+`))
 
-	log.Printf(
-		"VALID CLICK: %d/%d | total elapsed=%v",
-		currentValidClicks,
-		validClickLimit,
-		time.Since(start),
-	)
+	flusher.Flush()
 }
 
-// ---------------------------------------------------------
-// MAIN
-// ---------------------------------------------------------
+// STATUS ENDPOINT
+func status(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	completed := validClicks
+	reserved := reservedClicks
+	mu.Unlock()
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = w.Write([]byte(
+		"Completed: " + itoa(completed) +
+			"/" + itoa(validClickLimit) +
+			"\nValidating: " + itoa(reserved),
+	))
+}
+
+// SIMPLE INTEGER CONVERSION
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+
+	var buf [20]byte
+	i := len(buf)
+
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+
+	return string(buf[i:])
+}
 
 func main() {
+	mux := http.NewServeMux()
 
-	// -----------------------------------------------------
-	// PORT
-	// -----------------------------------------------------
+	mux.HandleFunc("/health", health)
+	mux.HandleFunc("/action", action)
+	mux.HandleFunc("/status", status)
+	mux.HandleFunc("/", landing)
 
-	// Use the platform-provided PORT when available.
-	// Otherwise use 8080 locally.
-	port := os.Getenv("PORT")
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
 
-	if port == "" {
-		port = "8080"
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	// -----------------------------------------------------
-	// ROUTES
-	// -----------------------------------------------------
+	log.Println("Server running on http://localhost:8080")
 
-	http.HandleFunc("/health", health)
-	http.HandleFunc("/", landing)
-
-	// -----------------------------------------------------
-	// SERVER
-	// -----------------------------------------------------
-
-	log.Printf(
-		"SERVER STARTING ON PORT %s",
-		port,
-	)
-
-	err := http.ListenAndServe(
-		":"+port,
-		nil,
-	)
-
-	if err != nil {
-		log.Fatal(err)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Server failed: %v", err)
 	}
 }
+
+
 
 
 
