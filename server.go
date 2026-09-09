@@ -1,4 +1,3 @@
-```go
 package main
 
 import (
@@ -222,4 +221,4 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
-```
+
