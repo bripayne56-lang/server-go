@@ -1,29 +1,34 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	validationTime           = 1 * time.Second
-	validClickLimit          = 10
+	// Validation delay.
+	validationTime = 1 * time.Second
+
+	// Maximum number of valid clicks during the lifetime
+	// of this server process.
+	validClickLimit = 10
+
+	// Maximum number of validations happening at once.
 	maxConcurrentValidations = 500
 )
 
 var (
 	mu sync.Mutex
 
-	// Clicks that successfully completed the 1-second validation.
+	// Clicks that successfully completed validation.
 	validClicks int
 
-	// Clicks currently waiting through the 1-second validation.
+	// Clicks that have reserved a slot and are currently
+	// going through the 1-second validation.
 	reservedClicks int
 
 	// Limits simultaneous validations.
@@ -45,6 +50,16 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
+	// LANDING PAGE
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		serveLandingPage(w, r, filePath)
+	})
+
+	// VERIFICATION REQUEST
+	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
+		verifyHandler(w, r, filePath)
+	})
+
 	// STATUS
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -63,49 +78,65 @@ func main() {
 		))
 	})
 
-	// LANDING PAGE
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		landing(w, r, filePath)
-	})
-
 	log.Println("Server running on port", port)
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
-	}
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func landing(w http.ResponseWriter, r *http.Request, filePath string) {
+// SERVE LANDING PAGE
+func serveLandingPage(w http.ResponseWriter, r *http.Request, filePath string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		// Fallback for non-streaming environments.
-		time.Sleep(validationTime)
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-
-		http.ServeFile(w, r, filePath)
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	// Avoid counting icon requests that browsers silently launch
-	// alongside the page load.
-	if r.URL.Path == "/favicon.ico" {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	// Read the actual index.html before beginning the delay.
 	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Println("Failed to read index.html:", err)
-		http.Error(
-			w,
-			"Could not load page",
-			http.StatusInternalServerError,
-		)
+		http.Error(w, "Could not load page", http.StatusInternalServerError)
 		return
 	}
+
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// Invisible data is sent and flushed first.
+	_, _ = w.Write([]byte("<!-- waiting -->"))
+	flusher.Flush()
+
+	// Wait one second.
+	time.Sleep(validationTime)
+
+	// Send the actual index.html.
+	_, _ = w.Write(page)
+	flusher.Flush()
+}
+
+// VERIFY HANDLER
+func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Anti-caching headers.
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	// Limit simultaneous validations.
 	select {
@@ -120,21 +151,21 @@ func landing(w http.ResponseWriter, r *http.Request, filePath string) {
 		return
 	}
 
-	// Reserve one of the 10 valid-click slots.
+	// Reserve one of the 10 available lifetime slots.
 	mu.Lock()
 
 	if validClicks+reservedClicks >= validClickLimit {
 		mu.Unlock()
 
 		log.Println("Rejected: valid click limit reached")
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
 
 	reservedClicks++
 
 	log.Printf(
-		"[CLICK] Reserved: completed=%d reserved=%d limit=%d",
+		"[VERIFY] Reserved: completed=%d reserved=%d limit=%d",
 		validClicks,
 		reservedClicks,
 		validClickLimit,
@@ -142,69 +173,57 @@ func landing(w http.ResponseWriter, r *http.Request, filePath string) {
 
 	mu.Unlock()
 
-	// Release the reservation when the request finishes.
+	// Release the reservation when this request ends.
 	defer func() {
 		mu.Lock()
 		reservedClicks--
 		mu.Unlock()
 	}()
 
-	// Cloud-safe streaming headers.
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	w.WriteHeader(http.StatusOK)
-
-	// Send 1 KB of invisible data immediately.
-	// Nothing visible from this portion is shown to the user.
-	_, _ = fmt.Fprintf(
-		w,
-		"<!DOCTYPE html><html><head><!--%s--></head><body>",
-		strings.Repeat(" ", 1024),
-	)
-
-	// Force the invisible buffer out immediately.
+	// Send invisible data first and flush it.
+	// Nothing visually meaningful is displayed.
+	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
 	flusher.Flush()
 
-	// Wait up to 1 second, but stop if the client disconnects.
+	// Wait for the validation period, while also watching
+	// for the client disconnecting.
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
 	case <-r.Context().Done():
-		log.Println(
-			"[DISCONNECT] User left before 1 second elapsed. Processing aborted.",
-		)
+		log.Println("[DISCONNECT DETECTED] Client disconnected during validation.")
 		return
 
 	case <-timer.C:
-		// User successfully waited the full 1 second.
+		// Validation completed.
 	}
 
-	// Count the click only after the full 1-second validation.
+	// Read the actual index.html.
+	page, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Println("Failed to read index.html:", err)
+		return
+	}
+
+	// Count the click only after the full validation period.
 	mu.Lock()
 	validClicks++
 
 	log.Printf(
-		"[CLICK] Valid click: %d/%d",
+		"[VERIFY] Valid click: %d/%d",
 		validClicks,
 		validClickLimit,
 	)
 
 	mu.Unlock()
 
-	// Send the actual contents of public/index.html.
+	// Send the actual index.html after validation.
 	_, _ = w.Write(page)
-
 	flusher.Flush()
 }
 
+// SIMPLE INTEGER CONVERSION
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
@@ -221,4 +240,5 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
 
