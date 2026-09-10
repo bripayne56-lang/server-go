@@ -15,7 +15,7 @@ const (
 
 	// Maximum number of valid clicks during the lifetime
 	// of this server process.
-	validClickLimit = 10
+	validClickLimit = 40
 
 	// Maximum number of validations happening at once.
 	maxConcurrentValidations = 500
