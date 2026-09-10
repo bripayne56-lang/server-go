@@ -14,44 +14,47 @@ import (
 )
 
 const (
+	// Validation delay.
 	validationTime = 1 * time.Second
 
-	// Maximum number of valid visits during this
-	// server process lifetime.
+	// Maximum number of valid clicks during the lifetime
+	// of this server process.
 	validClickLimit = 40
 
-	// Maximum number of validations running at once.
-	maxConcurrentValidations = 500
+	// Maximum number of validations happening at once.
+	maxConcurrentValidations = 100
 
-	// How long client records are kept.
-	clientLifetime = 24 * time.Hour
+	// How long an IP is blocked between clicks.
+	ipCooldown = 3 * time.Second
+
+	// How long a successful validation can wait
+	// for the browser to confirm page delivery.
+	confirmationTimeout = 10 * time.Second
 )
 
-type clientState struct {
-	createdAt time.Time
-
-	// true while this client is currently being validated.
-	validating bool
-
-	// true after this client has successfully completed
-	// validation and has been counted.
-	counted bool
+type validationSession struct {
+	ip        string
+	expiresAt time.Time
 }
 
 var (
 	mu sync.Mutex
 
-	validClicks    int
+	// Clicks that successfully completed validation
+	// AND were confirmed by the browser.
+	validClicks int
+
+	// Clicks currently going through validation.
 	reservedClicks int
 
+	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentValidations)
 
-	// Browser IDs.
-	clients = make(map[string]*clientState)
+	// Stores the last click time for each IP.
+	ipTrack sync.Map
 
-	// Fallback protection for multiple simultaneous requests
-	// arriving before the browser has received its cookie.
-	pending = make(map[string]time.Time)
+	// Stores validation sessions waiting for browser confirmation.
+	validationSessions sync.Map
 )
 
 func main() {
@@ -62,37 +65,44 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
-	// ------------------------------------------------------------
 	// HEALTH CHECK
-	// ------------------------------------------------------------
-
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	// ------------------------------------------------------------
-	// MAIN ENTRY POINT
-	//
-	// Users visiting the load balancer URL arrive here.
-	//
-	// There is intentionally NO public /index.html route.
-	// ------------------------------------------------------------
-
+	// LANDING PAGE
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
+		serveLandingPage(w, r, filePath)
+	})
 
+	// PRECHECK
+	// This is the public entry point.
+	// It performs the 1-second validation before
+	// sending the actual index.html.
+	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
 		verifyHandler(w, r, filePath)
 	})
 
-	// ------------------------------------------------------------
-	// STATUS
-	// ------------------------------------------------------------
+	// VERIFY
+	// Kept available in case it is needed later.
+	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
+		verifyHandler(w, r, filePath)
+	})
 
+	// CONFIRM CLICK
+	// Called by index.html after the browser receives
+	// and begins rendering the page.
+	http.HandleFunc("/confirm-click", confirmClickHandler)
+
+	// INDEX.HTML
+	// Serves the actual landing page.
+	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
+		indexHandler(w, r, filePath)
+	})
+
+	// STATUS
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		completed := validClicks
@@ -101,6 +111,7 @@ func main() {
 
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
 
 		_, _ = w.Write([]byte(
 			"Completed: " + itoa(completed) +
@@ -114,42 +125,23 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ------------------------------------------------------------
-// VALIDATION
-// ------------------------------------------------------------
-
-func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
-
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+// SERVE LANDING PAGE
+// Used for "/".
+// This delays the page but does not count the visit
+// as one of the 40 valid clicks.
+func serveLandingPage(w http.ResponseWriter, r *http.Request, filePath string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	// ----------------------------------------------------------
-	// Get browser ID.
-	// ----------------------------------------------------------
-
-	clientID, isNew := getClientID(r)
-
-	// If this is a new browser, send its cookie immediately.
-	//
-	// This is important because the browser needs to receive
-	// the cookie BEFORE the one-second validation finishes.
-	if isNew {
-		http.SetCookie(w, &http.Cookie{
-			Name:     "client_id",
-			Value:    clientID,
-			Path:     "/",
-			MaxAge:   int(clientLifetime.Seconds()),
-			HttpOnly: true,
-			Secure:   true,
-			SameSite: http.SameSiteLaxMode,
-		})
+	page, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Println("Failed to read index.html:", err)
+		http.Error(w, "Could not load page", http.StatusInternalServerError)
+		return
 	}
-
-	// ----------------------------------------------------------
-	// Required headers.
-	// ----------------------------------------------------------
 
 	w.Header().Set(
 		"Cache-Control",
@@ -157,123 +149,74 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 	)
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// Invisible data is sent first.
+	_, _ = w.Write([]byte("<!-- waiting -->"))
+	flusher.Flush()
+
+	// Wait one second.
+	time.Sleep(validationTime)
+
+	// Send the actual page.
+	_, _ = w.Write(page)
+	flusher.Flush()
+}
+
+// VERIFY HANDLER
+// Used by /precheck and /verify.
+//
+// Applies the IP cooldown,
+// reserves one of the 40 lifetime slots,
+// waits one second,
+// checks whether the client stayed connected,
+// then sends index.html with a one-time
+// confirmation token.
+//
+// The click is NOT counted yet.
+// It is counted only when /confirm-click
+// successfully confirms the browser received the page.
+func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Anti-caching headers.
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	// ----------------------------------------------------------
-	// Obtain Flusher.
-	// ----------------------------------------------------------
+	// 1. IP RATE LIMITING CHECK (GCP Load Balancer Compatible)
+	ip := getClientIP(r)
 
-	flusher, ok := w.(http.Flusher)
+	if ip != "" {
+		if lastClickAt, found := ipTrack.Load(ip); found {
+			if time.Since(lastClickAt.(time.Time)) < ipCooldown {
+				log.Printf(
+					"[RATE LIMIT] Rejected IP: %s (too fast). Sending 204.",
+					ip,
+				)
 
-	if !ok {
-		http.Error(
-			w,
-			"Streaming not supported",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	// ----------------------------------------------------------
-	// Lock this browser/client.
-	// ----------------------------------------------------------
-
-	mu.Lock()
-
-	cleanupOldClients()
-
-	state, exists := clients[clientID]
-
-	if !exists {
-		state = &clientState{
-			createdAt: time.Now(),
+				// Return 204 No Content instead of 429.
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 		}
 
-		clients[clientID] = state
+		// Track or update this IP's arrival timestamp.
+		ipTrack.Store(ip, time.Now())
 	}
 
-	// Already counted.
-	//
-	// Serve the page, but DO NOT increment the counter.
-	if state.counted {
-		mu.Unlock()
-
-		log.Printf(
-			"[ALREADY COUNTED] client=%s",
-			clientID,
-		)
-
-		servePage(w, flusher, filePath)
-		return
-	}
-
-	// Already being validated.
-	//
-	// This is the important duplicate protection.
-	if state.validating {
-		mu.Unlock()
-
-		log.Printf(
-			"[DUPLICATE VALIDATION] client=%s",
-			clientID,
-		)
-
-		http.Error(
-			w,
-			"Validation already in progress",
-			http.StatusConflict,
-		)
-		return
-	}
-
-	// ----------------------------------------------------------
-	// Reserve one of the 40 lifetime slots.
-	// ----------------------------------------------------------
-
-	if validClicks+reservedClicks >= validClickLimit {
-		mu.Unlock()
-
-		log.Printf(
-			"[LIMIT REACHED] completed=%d reserved=%d",
-			validClicks,
-			reservedClicks,
-		)
-
-		http.Error(
-			w,
-			"Click limit reached",
-			http.StatusTooManyRequests,
-		)
-		return
-	}
-
-	state.validating = true
-	reservedClicks++
-
-	mu.Unlock()
-
-	// Always release validation state.
-	defer func() {
-		mu.Lock()
-
-		state.validating = false
-		reservedClicks--
-
-		// If it wasn't counted, remove it so a later
-		// legitimate visit can try again.
-		if !state.counted {
-			delete(clients, clientID)
-		}
-
-		mu.Unlock()
-	}()
-
-	// ----------------------------------------------------------
-	// Concurrency limit.
-	// ----------------------------------------------------------
-
+	// 2. CONCURRENCY SEMAPHORE
 	select {
 	case validationSemaphore <- struct{}{}:
 		defer func() {
@@ -281,306 +224,271 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 		}()
 
 	default:
-		log.Printf(
-			"[CONCURRENCY REJECTED] client=%s",
-			clientID,
-		)
-
-		http.Error(
-			w,
-			"Too many validations",
-			http.StatusServiceUnavailable,
-		)
+		log.Println("Rejected: concurrency limit reached")
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
-	// ----------------------------------------------------------
-	// SEND INVISIBLE DATA.
-	//
-	// This flushes the response headers and cookie to the browser.
-	// ----------------------------------------------------------
+	// 3. CAPACITY PRE-CHECK
+	mu.Lock()
 
-	_, _ = w.Write([]byte("<!-- validating -->"))
-	flusher.Flush()
+	if validClicks+reservedClicks >= validClickLimit {
+		mu.Unlock()
+
+		log.Println("Rejected: valid click limit completely reached")
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
+
+	reservedClicks++
 
 	log.Printf(
-		"[VALIDATING] client=%s",
-		clientID,
+		"[VERIFY] Reserved: completed=%d reserved=%d limit=%d",
+		validClicks,
+		reservedClicks,
+		validClickLimit,
 	)
 
-	// ----------------------------------------------------------
-	// WAIT ONE SECOND.
-	// ----------------------------------------------------------
+	mu.Unlock()
 
+	// Release the reservation when this request ends.
+	defer func() {
+		mu.Lock()
+		reservedClicks--
+		mu.Unlock()
+	}()
+
+	// Send invisible validation data.
+	// Nothing visual appears on the page.
+	_, _ = w.Write([]byte("<!-- waiting for validation -->"))
+	flusher.Flush()
+
+	// 4. WATCH TIMER & CONTEXT DROPS
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
-
 	case <-r.Context().Done():
-
-		// Client disconnected before validation completed.
-		log.Printf(
-			"[INVALID - DISCONNECTED] client=%s",
-			clientID,
+		log.Println(
+			"[DISCONNECT DETECTED] Client disconnected during validation. Click discarded.",
 		)
-
 		return
 
 	case <-timer.C:
-
-		// One second completed.
+		// Validation completed.
 	}
 
-	// ----------------------------------------------------------
-	// CHECK CONNECTION AGAIN.
-	// ----------------------------------------------------------
-
-	select {
-
-	case <-r.Context().Done():
-
-		log.Printf(
-			"[INVALID - DISCONNECTED AFTER TIMER] client=%s",
-			clientID,
-		)
-
-		return
-
-	default:
-	}
-
-	// ----------------------------------------------------------
-	// READ INDEX.HTML.
-	// ----------------------------------------------------------
-
+	// 5. READ THE ACTUAL PAGE
+	// Do this before creating a confirmation session.
 	page, err := os.ReadFile(filePath)
-
 	if err != nil {
-		log.Printf(
-			"[FILE ERROR] client=%s: %v",
-			clientID,
-			err,
-		)
-
-		http.Error(
-			w,
-			"Could not load page",
-			http.StatusInternalServerError,
-		)
-
+		log.Println("Failed to read index.html:", err)
 		return
 	}
 
-	// ----------------------------------------------------------
-	// FINAL CONNECTION CHECK.
-	// ----------------------------------------------------------
-
-	select {
-
-	case <-r.Context().Done():
-
-		log.Printf(
-			"[INVALID - GONE BEFORE COUNT] client=%s",
-			clientID,
-		)
-
+	// 6. CREATE ONE-TIME CONFIRMATION SESSION
+	token, err := generateToken()
+	if err != nil {
+		log.Println("Failed to generate confirmation token:", err)
 		return
-
-	default:
 	}
 
-	// ----------------------------------------------------------
-	// COUNT EXACTLY ONCE.
-	// ----------------------------------------------------------
+	validationSessions.Store(token, validationSession{
+		ip:        ip,
+		expiresAt: time.Now().Add(confirmationTimeout),
+	})
 
+	// If the browser never confirms, clean up the session
+	// and release the reserved slot after the timeout.
+	time.AfterFunc(confirmationTimeout, func() {
+		if value, found := validationSessions.Load(token); found {
+			session := value.(validationSession)
+
+			if time.Now().After(session.expiresAt) {
+				if validationSessions.CompareAndDelete(token, value) {
+					log.Printf(
+						"[CONFIRMATION TIMEOUT] IP: %s. Click discarded.",
+						session.ip,
+					)
+				}
+			}
+		}
+	})
+
+	// 7. INJECT THE ONE-TIME CONFIRMATION TOKEN
+	// The token allows index.html to prove that this
+	// page came from a completed validation.
+	tokenScript := []byte(
+		"<script>window.__confirmationToken=" +
+			"'" + token + "';</script>\n",
+	)
+
+	_, _ = w.Write(tokenScript)
+	_, _ = w.Write(page)
+	flusher.Flush()
+
+	// The click remains reserved until /confirm-click
+	// confirms the browser received the page.
+}
+
+// CONFIRM CLICK
+// Called by index.html after the browser receives
+// and begins rendering the page.
+//
+// The request must provide a valid one-time token.
+// The token must belong to the same IP that passed validation.
+// A successful confirmation increments validClicks.
+func confirmClickHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	value, found := validationSessions.Load(token)
+	if !found {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	session := value.(validationSession)
+
+	// Check expiration.
+	if time.Now().After(session.expiresAt) {
+		validationSessions.Delete(token)
+
+		log.Printf(
+			"[CONFIRMATION EXPIRED] IP: %s",
+			session.ip,
+		)
+
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Confirm that the browser's IP matches
+	// the IP that completed validation.
+	ip := getClientIP(r)
+
+	if ip == "" || ip != session.ip {
+		log.Printf(
+			"[CONFIRMATION REJECTED] IP mismatch. Expected=%s Received=%s",
+			session.ip,
+			ip,
+		)
+
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Consume the token BEFORE incrementing the count.
+	// This prevents the same token from being confirmed twice.
+	if !validationSessions.CompareAndDelete(token, value) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Final lifetime-capacity check.
 	mu.Lock()
 
-	// Final duplicate check.
-	//
-	// Another request can never normally get here because
-	// validating=true blocks it, but this makes the count
-	// operation itself safe.
-	state = clients[clientID]
-
-	if state == nil || state.counted {
-		mu.Unlock()
-
-		log.Printf(
-			"[DUPLICATE BLOCKED AT COMMIT] client=%s",
-			clientID,
-		)
-
-		return
-	}
-
-	// Final limit check.
 	if validClicks >= validClickLimit {
 		mu.Unlock()
 
-		log.Printf(
-			"[LIMIT REACHED AT COMMIT] client=%s",
-			clientID,
+		log.Println(
+			"[CONFIRMATION REJECTED] Valid click limit reached.",
 		)
 
-		http.Error(
-			w,
-			"Click limit reached",
-			http.StatusTooManyRequests,
-		)
-
+		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
 
-	// THIS is the only place the counter increases.
 	validClicks++
 
-	// Permanently mark this browser as counted.
-	state.counted = true
-	state.createdAt = time.Now()
-
-	count := validClicks
-
-	mu.Unlock()
-
 	log.Printf(
-		"[VALID CLICK] client=%s count=%d/%d",
-		clientID,
-		count,
+		"[CONFIRMED] Click successfully delivered to active browser! %d/%d",
+		validClicks,
 		validClickLimit,
 	)
 
-	// ----------------------------------------------------------
-	// SEND THE ACTUAL PAGE.
-	// ----------------------------------------------------------
+	mu.Unlock()
 
-	_, err = w.Write(page)
-
-	if err != nil {
-		log.Printf(
-			"[PAGE WRITE ERROR] client=%s: %v",
-			clientID,
-			err,
-		)
-
-		return
-	}
-
-	flusher.Flush()
-}
-
-// ------------------------------------------------------------
-// GET OR CREATE CLIENT ID
-// ------------------------------------------------------------
-
-func getClientID(r *http.Request) (string, bool) {
-
-	cookie, err := r.Cookie("client_id")
-
-	if err == nil && cookie.Value != "" {
-		return cookie.Value, false
-	}
-
-	// Generate a random browser ID.
-	buf := make([]byte, 16)
-
-	if _, err := rand.Read(buf); err != nil {
-		// Extremely unlikely.
-		// Fall back to a deterministic temporary identifier.
-		return fallbackClientID(r), true
-	}
-
-	return hex.EncodeToString(buf), true
-}
-
-// ------------------------------------------------------------
-// FALLBACK CLIENT ID
-// ------------------------------------------------------------
-//
-// This is only used if crypto/rand fails.
-//
-// ------------------------------------------------------------
-
-func fallbackClientID(r *http.Request) string {
-
-	ip := clientIP(r)
-
-	userAgent := r.Header.Get("User-Agent")
-
-	return ip + "|" + userAgent
-}
-
-// ------------------------------------------------------------
-// CLIENT IP
-// ------------------------------------------------------------
-
-func clientIP(r *http.Request) string {
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-
-	if err == nil {
-		return host
-	}
-
-	return strings.TrimSpace(r.RemoteAddr)
-}
-
-// ------------------------------------------------------------
-// CLEAN OLD CLIENTS
-// ------------------------------------------------------------
-
-func cleanupOldClients() {
-
-	now := time.Now()
-
-	for id, state := range clients {
-
-		if state.validating {
-			continue
-		}
-
-		if now.Sub(state.createdAt) > clientLifetime {
-			delete(clients, id)
-		}
-	}
-}
-
-// ------------------------------------------------------------
-// SERVE PAGE WITHOUT COUNTING
-// ------------------------------------------------------------
-
-func servePage(
-	w http.ResponseWriter,
-	flusher http.Flusher,
-	filePath string,
-) {
-
-	page, err := os.ReadFile(filePath)
-
-	if err != nil {
-		http.Error(
-			w,
-			"Could not load page",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-
-	_, _ = w.Write(page)
-
-	flusher.Flush()
 }
 
-// ------------------------------------------------------------
+// GET CLIENT IP
+// Uses X-Forwarded-For when behind the GCP Load Balancer.
+// The first IP in the list is treated as the original client.
+// Falls back to RemoteAddr for local testing.
+func getClientIP(r *http.Request) string {
+	var ip string
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ip = xff
+
+		for i, ch := range xff {
+			if ch == ',' {
+				ip = xff[:i]
+				break
+			}
+		}
+
+		ip = strings.TrimSpace(ip)
+	} else {
+		var err error
+
+		ip, _, err = net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
+
+		ip = strings.TrimSpace(ip)
+	}
+
+	return ip
+}
+
+// GENERATE RANDOM CONFIRMATION TOKEN
+func generateToken() (string, error) {
+	var bytes [32]byte
+
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(bytes[:]), nil
+}
+
+// INDEX.HTML
+// Serves the actual page.
+func indexHandler(w http.ResponseWriter, r *http.Request, filePath string) {
+	page, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Println("Failed to read index.html:", err)
+		http.Error(w, "Could not load page", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set(
+		"Cache-Control",
+		"no-store, no-cache, must-revalidate, max-age=0",
+	)
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(page)
+}
+
 // SIMPLE INTEGER CONVERSION
-// ------------------------------------------------------------
-
 func itoa(n int) string {
-
 	if n == 0 {
 		return "0"
 	}
@@ -596,7 +504,6 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
-
 
 
 
