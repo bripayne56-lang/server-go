@@ -10,11 +10,10 @@ import (
 )
 
 const (
-	// Validation delay.
+	// How long a request must remain connected to become valid.
 	validationTime = 1 * time.Second
 
-	// Maximum number of valid clicks during the lifetime
-	// of this server process.
+	// Maximum number of valid clicks during this server process.
 	validClickLimit = 40
 
 	// Maximum number of validations happening at once.
@@ -27,7 +26,7 @@ var (
 	// Clicks that successfully completed validation.
 	validClicks int
 
-	// Clicks currently going through validation.
+	// Clicks currently being validated.
 	reservedClicks int
 
 	// Limits simultaneous validations.
@@ -50,26 +49,29 @@ func main() {
 	})
 
 	// PRECHECK
-	// Performs the 1-second validation but never sends HTML.
+	// Validates for one second but never sends HTML.
 	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		validateOnly(w, r)
-	})
+		if !validateRequest(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 
-	// VERIFY
-	// Performs validation and then serves index.html.
-	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
-		verifyHandler(w, r, filePath)
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	// ROOT
-	// The normal website entry point.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		verifyHandler(w, r, filePath)
+		serveValidatedPage(w, r, filePath)
+	})
+
+	// VERIFY
+	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
+		serveValidatedPage(w, r, filePath)
 	})
 
 	// INDEX.HTML
 	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
-		verifyHandler(w, r, filePath)
+		serveValidatedPage(w, r, filePath)
 	})
 
 	// STATUS
@@ -95,96 +97,89 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// VALIDATE ONLY
-// Used by /precheck.
-// Performs the same validation and counting logic,
-// but never sends index.html.
-func validateOnly(w http.ResponseWriter, r *http.Request) {
-	if !reserveClick(w) {
-		return
+// VALIDATE REQUEST
+//
+// Reserves a lifetime click slot, waits one second,
+// and only then converts the reservation into a valid click.
+//
+// A disconnect before the timer completes releases the
+// reservation and does not increment validClicks.
+func validateRequest(r *http.Request) bool {
+	// Limit simultaneous validations.
+	select {
+	case validationSemaphore <- struct{}{}:
+	default:
+		return false
 	}
 
+	// Reserve one lifetime click slot.
+	mu.Lock()
+
+	if validClicks+reservedClicks >= validClickLimit {
+		mu.Unlock()
+		<-validationSemaphore
+		return false
+	}
+
+	reservedClicks++
+
+	mu.Unlock()
+
+	// Make exactly one outcome responsible for this reservation.
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
 	case <-r.Context().Done():
-		releaseReservation()
+		// The client disconnected before validation completed.
+		mu.Lock()
+
+		// Remove the reservation.
+		reservedClicks--
+
+		mu.Unlock()
+
+		<-validationSemaphore
+
 		log.Println("validation disconnected; click discarded")
-		return
+		return false
 
 	case <-timer.C:
+		// The full validation period completed first.
 	}
 
+	// Convert the reservation into a valid click.
 	mu.Lock()
 
-	if validClicks >= validClickLimit {
-		mu.Unlock()
-		releaseReservation()
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	validClicks++
+	// The reservation still belongs to this request.
+	// Convert it directly into one completed click.
 	reservedClicks--
+	validClicks++
 
 	clickNumber := validClicks
 
 	mu.Unlock()
 
+	<-validationSemaphore
+
 	log.Printf("valid click %d/%d", clickNumber, validClickLimit)
 
-	w.WriteHeader(http.StatusNoContent)
+	return true
 }
 
-// VERIFY HANDLER
-// Validates for one second, then serves index.html
-// if the validation succeeds.
-func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
-	if !reserveClick(w) {
+// SERVE VALIDATED PAGE
+func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
+	if !validateRequest(r) {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	timer := time.NewTimer(validationTime)
-	defer timer.Stop()
-
-	select {
-	case <-r.Context().Done():
-		releaseReservation()
-		log.Println("validation disconnected; click discarded")
-		return
-
-	case <-timer.C:
-	}
-
-	// Read the page before consuming the reserved slot.
 	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Println("failed to read index.html:", err)
-		releaseReservation()
 		http.Error(w, "Could not load page", http.StatusInternalServerError)
 		return
 	}
-
-	mu.Lock()
-
-	if validClicks >= validClickLimit {
-		mu.Unlock()
-		releaseReservation()
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	validClicks++
-	reservedClicks--
-
-	clickNumber := validClicks
-
-	mu.Unlock()
-
-	log.Printf("valid click %d/%d", clickNumber, validClickLimit)
 
 	w.Header().Set(
 		"Cache-Control",
@@ -197,44 +192,6 @@ func verifyHandler(w http.ResponseWriter, r *http.Request, filePath string) {
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(page)
-}
-
-// RESERVE CLICK
-func reserveClick(w http.ResponseWriter) bool {
-	// Limit simultaneous validations.
-	select {
-	case validationSemaphore <- struct{}{}:
-	default:
-		w.WriteHeader(http.StatusNoContent)
-		return false
-	}
-
-	mu.Lock()
-
-	// Make sure completed + currently validating
-	// never exceeds the lifetime limit.
-	if validClicks+reservedClicks >= validClickLimit {
-		mu.Unlock()
-
-		<-validationSemaphore
-		w.WriteHeader(http.StatusNoContent)
-		return false
-	}
-
-	reservedClicks++
-
-	mu.Unlock()
-
-	return true
-}
-
-// RELEASE RESERVATION
-func releaseReservation() {
-	mu.Lock()
-	reservedClicks--
-	mu.Unlock()
-
-	<-validationSemaphore
 }
 
 // SIMPLE INTEGER CONVERSION
@@ -254,6 +211,8 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
+
 
 
 
