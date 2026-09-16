@@ -61,17 +61,26 @@ func main() {
 	})
 
 	// ROOT
-	// This is the actual click/validation endpoint.
+	// ONLY "/" is allowed to enter the validation handler.
+	// Other paths are rejected and cannot consume a click.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			log.Printf("REJECTED PATH: method=%s path=%s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+
 		serveValidatedPage(w, r, filePath)
 	})
 
 	// VERIFY
+	// Explicit validation endpoint.
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		serveValidatedPage(w, r, filePath)
 	})
 
 	// INDEX.HTML
+	// Explicit validation endpoint.
 	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
 		serveValidatedPage(w, r, filePath)
 	})
@@ -123,8 +132,7 @@ func waitForPrecheck(r *http.Request) bool {
 // waits one second, checks for disconnect,
 // then converts the reservation into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
-
-	// LOG EVERY REQUEST PATH
+	// Log every request that actually enters validation.
 	log.Printf("REQUEST: method=%s path=%s", r.Method, r.URL.Path)
 
 	// Limit simultaneous validations.
@@ -237,6 +245,7 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
 
 
 
