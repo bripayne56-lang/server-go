@@ -123,6 +123,10 @@ func waitForPrecheck(r *http.Request) bool {
 // waits one second, checks for disconnect,
 // then converts the reservation into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
+
+	// LOG EVERY REQUEST PATH
+	log.Printf("REQUEST: method=%s path=%s", r.Method, r.URL.Path)
+
 	// Limit simultaneous validations.
 	select {
 	case validationSemaphore <- struct{}{}:
@@ -233,6 +237,8 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
+
+
 
 
 
