@@ -2,9 +2,11 @@ package main
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,6 +20,10 @@ const (
 
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
+
+	// How long an IP must wait after a successful click
+	// before it can count another click.
+	ipCooldown = 3 * time.Second
 )
 
 var (
@@ -31,6 +37,9 @@ var (
 
 	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
+
+	// Tracks the last successfully counted click for each IP.
+	ipTrack sync.Map
 )
 
 func main() {
@@ -65,7 +74,11 @@ func main() {
 	// Other paths are rejected and cannot consume a click.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
-			log.Printf("REJECTED PATH: method=%s path=%s", r.Method, r.URL.Path)
+			log.Printf(
+				"REJECTED PATH: method=%s path=%s",
+				r.Method,
+				r.URL.Path,
+			)
 			http.NotFound(w, r)
 			return
 		}
@@ -74,13 +87,11 @@ func main() {
 	})
 
 	// VERIFY
-	// Explicit validation endpoint.
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		serveValidatedPage(w, r, filePath)
 	})
 
 	// INDEX.HTML
-	// Explicit validation endpoint.
 	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
 		serveValidatedPage(w, r, filePath)
 	})
@@ -108,6 +119,35 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+// GET CLIENT IP
+//
+// Nginx forwards the original client IP in X-Forwarded-For.
+// If that header is unavailable, fall back to RemoteAddr.
+func getClientIP(r *http.Request) string {
+	forwarded := r.Header.Get("X-Forwarded-For")
+
+	if forwarded != "" {
+		// X-Forwarded-For can contain multiple addresses.
+		// The first address is the original client.
+		parts := strings.Split(forwarded, ",")
+
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return ip
+	}
+
+	return r.RemoteAddr
+}
+
 // PRECHECK
 //
 // Performs the one-second connection check.
@@ -132,8 +172,27 @@ func waitForPrecheck(r *http.Request) bool {
 // waits one second, checks for disconnect,
 // then converts the reservation into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
-	// Log every request that actually enters validation.
-	log.Printf("REQUEST: method=%s path=%s", r.Method, r.URL.Path)
+	clientIP := getClientIP(r)
+
+	log.Printf(
+		"REQUEST: method=%s path=%s ip=%s",
+		r.Method,
+		r.URL.Path,
+		clientIP,
+	)
+
+	// Check whether this IP recently completed a click.
+	if lastClickAt, found := ipTrack.Load(clientIP); found {
+		if time.Since(lastClickAt.(time.Time)) < ipCooldown {
+			log.Printf(
+				"IP COOLDOWN: ip=%s",
+				clientIP,
+			)
+
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	// Limit simultaneous validations.
 	select {
@@ -179,7 +238,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	select {
 	case <-r.Context().Done():
-		log.Println("validation disconnected; click discarded")
+		log.Printf(
+			"validation disconnected; click discarded ip=%s",
+			clientIP,
+		)
 		w.WriteHeader(http.StatusNoContent)
 		return
 
@@ -212,7 +274,15 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	completed = true
 
-	log.Printf("valid click %d/%d", clickNumber, validClickLimit)
+	// Record the successful click time for this IP.
+	ipTrack.Store(clientIP, time.Now())
+
+	log.Printf(
+		"valid click %d/%d ip=%s",
+		clickNumber,
+		validClickLimit,
+		clientIP,
+	)
 
 	// Send the actual page.
 	w.Header().Set(
@@ -245,16 +315,4 @@ func itoa(n int) string {
 
 	return string(buf[i:])
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
