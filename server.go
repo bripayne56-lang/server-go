@@ -115,27 +115,46 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 		<-validationSemaphore
 	}()
 
+	// Start timing the validation.
+	start := time.Now()
+
 	// One-second validation.
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
 	case <-r.Context().Done():
+		log.Printf(
+			"CONTEXT DONE after %v",
+			time.Since(start),
+		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 
 	case <-timer.C:
+		log.Printf(
+			"TIMER FIRED after %v",
+			time.Since(start),
+		)
 	}
 
-	// IMPORTANT:
-	// Check the connection again immediately after the
-	// one-second timer finishes, before counting the click.
+	// Check whether the disconnect has been detected
+	// immediately after the timer finishes.
 	if r.Context().Err() != nil {
+		log.Printf(
+			"CONTEXT CHECK: disconnected after timer at %v",
+			time.Since(start),
+		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	log.Printf(
+		"CONTEXT CHECK: still connected after timer at %v",
+		time.Since(start),
+	)
 
 	// Read the page before consuming the reservation.
 	page, err := os.ReadFile(filePath)
@@ -148,6 +167,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	// Check again immediately before converting the
 	// reservation into a valid click.
 	if r.Context().Err() != nil {
+		log.Printf(
+			"CONTEXT CHECK: disconnected before count at %v",
+			time.Since(start),
+		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -167,6 +190,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	if r.Context().Err() != nil {
 		mu.Unlock()
 
+		log.Printf(
+			"CONTEXT CHECK: disconnected at final count at %v",
+			time.Since(start),
+		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -182,9 +209,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	completed = true
 
 	log.Printf(
-		"valid click %d/%d",
+		"valid click %d/%d after %v",
 		clickNumber,
 		validClickLimit,
+		time.Since(start),
 	)
 
 	// Send the actual page.
