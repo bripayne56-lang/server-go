@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,32 +13,45 @@ import (
 )
 
 const (
-	validationTime     = 1 * time.Second
-	validClickLimit    = 40
+	// How long validation must last.
+	validationTime = 1 * time.Second
+
+	// Maximum number of valid clicks during this server process.
+	validClickLimit = 40
+
+	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
+
+	// How long to remember a failed/disconnected validation
+	// on the SAME HTTP connection.
+	//
+	// This is NOT an IP cooldown.
+	disconnectRetryWindow = 2 * time.Second
 )
 
-type clickState int
-
-const (
-	clickPending clickState = iota
-	clickCounted
-	clickFailed
-)
+type connectionKey struct {
+	id uint64
+}
 
 var (
 	mu sync.Mutex
 
-	validClicks   int
+	// Successfully completed valid clicks.
+	validClicks int
+
+	// Clicks currently being validated.
 	reservedClicks int
 
+	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
 
-	// Tracks each individual click ID.
-	// A click ID can only be counted once.
-	clicks = make(map[string]clickState)
+	// Connections whose validation recently failed/disconnected.
+	//
+	// Keyed by HTTP connection ID, NOT IP address.
+	recentFailedConnections = make(map[uint64]time.Time)
 
-	requestID atomic.Uint64
+	requestID    atomic.Uint64
+	connectionID atomic.Uint64
 )
 
 func main() {
@@ -46,6 +61,27 @@ func main() {
 	}
 
 	filePath := filepath.Join("public", "index.html")
+
+	// ------------------------------------------------------------
+	// HTTP server.
+	//
+	// ConnContext gives every TCP connection a unique server-side
+	// ID. This lets us recognize a retry on the same connection
+	// without using IP addresses.
+	// ------------------------------------------------------------
+	server := &http.Server{
+		Addr: ":" + port,
+
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			id := connectionID.Add(1)
+
+			return context.WithValue(
+				ctx,
+				connectionKey{},
+				id,
+			)
+		},
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/" {
@@ -57,116 +93,85 @@ func main() {
 	})
 
 	log.Println("Server running on port", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	log.Fatal(server.ListenAndServe())
 }
 
+func getConnectionID(r *http.Request) uint64 {
+	id, ok := r.Context().Value(connectionKey{}).(uint64)
+	if !ok {
+		return 0
+	}
+
+	return id
+}
+
+// Returns true when this exact HTTP connection recently failed
+// a validation.
+func recentlyFailed(connID uint64) bool {
+	if connID == 0 {
+		return false
+	}
+
+	now := time.Now()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	last, found := recentFailedConnections[connID]
+	if !found {
+		return false
+	}
+
+	if now.Sub(last) >= disconnectRetryWindow {
+		delete(recentFailedConnections, connID)
+		return false
+	}
+
+	return true
+}
+
+// Records a failed validation for this HTTP connection.
+func rememberFailedConnection(connID uint64) {
+	if connID == 0 {
+		return
+	}
+
+	mu.Lock()
+	recentFailedConnections[connID] = time.Now()
+	mu.Unlock()
+}
+
+// Waits one second, checks for disconnect,
+// then converts the request into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
 	reqID := requestID.Add(1)
-
-	// The frontend must send a unique ID for each physical click.
-	clickID := r.URL.Query().Get("click_id")
+	connID := getConnectionID(r)
 
 	log.Printf(
-		"REQUEST req=%d click=%q method=%s path=%s",
+		"REQUEST req=%d conn=%d method=%s path=%s",
 		reqID,
-		clickID,
+		connID,
 		r.Method,
 		r.URL.Path,
 	)
 
 	// ------------------------------------------------------------
-	// A click ID is required.
+	// Reject only an immediate retry on the SAME connection after
+	// a failed/disconnected validation.
+	//
+	// There is NO IP check here.
 	// ------------------------------------------------------------
-	if clickID == "" {
+	if recentlyFailed(connID) {
 		log.Printf(
-			"REJECT req=%d reason=missing-click-id",
+			"REJECT req=%d conn=%d reason=recent-failed-connection",
 			reqID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-
-	// ------------------------------------------------------------
-	// Claim this click ID.
-	//
-	// This is the important duplicate protection:
-	// the same click ID cannot be validated by two requests
-	// simultaneously.
-	// ------------------------------------------------------------
-	mu.Lock()
-
-	if state, exists := clicks[clickID]; exists {
-		switch state {
-		case clickPending:
-			mu.Unlock()
-
-			log.Printf(
-				"REJECT req=%d click=%q reason=duplicate-pending",
-				reqID,
-				clickID,
-			)
-
-			w.WriteHeader(http.StatusNoContent)
-			return
-
-		case clickCounted:
-			mu.Unlock()
-
-			log.Printf(
-				"REJECT req=%d click=%q reason=already-counted",
-				reqID,
-				clickID,
-			)
-
-			w.WriteHeader(http.StatusNoContent)
-			return
-
-		case clickFailed:
-			mu.Unlock()
-
-			log.Printf(
-				"REJECT req=%d click=%q reason=already-failed",
-				reqID,
-				clickID,
-			)
-
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-	}
-
-	// Mark the click as pending before doing any validation.
-	clicks[clickID] = clickPending
-
-	mu.Unlock()
-
-	// If this request fails for any reason, the click must
-	// never become counted.
-	completed := false
-
-	defer func() {
-		if !completed {
-			mu.Lock()
-
-			// Keep the click ID permanently failed.
-			// A retry using the same click ID cannot become
-			// a second valid click.
-			clicks[clickID] = clickFailed
-
-			if reservedClicks > 0 {
-				reservedClicks--
-			}
-
-			mu.Unlock()
-
-			log.Printf(
-				"FAILED req=%d click=%q",
-				reqID,
-				clickID,
-			)
-		}
-	}()
 
 	// ------------------------------------------------------------
 	// Limit simultaneous validations.
@@ -179,9 +184,9 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	default:
 		log.Printf(
-			"REJECT req=%d click=%q reason=validation-capacity",
+			"REJECT req=%d conn=%d reason=validation-capacity",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -197,9 +202,9 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 		mu.Unlock()
 
 		log.Printf(
-			"REJECT req=%d click=%q reason=click-limit completed=%d validating=%d",
+			"REJECT req=%d conn=%d reason=click-limit completed=%d validating=%d",
 			reqID,
-			clickID,
+			connID,
 			validClicks,
 			reservedClicks,
 		)
@@ -210,15 +215,36 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	reservedClicks++
 
+	reservationHeld := true
+
 	log.Printf(
-		"RESERVED req=%d click=%q completed=%d validating=%d",
+		"RESERVED req=%d conn=%d completed=%d validating=%d",
 		reqID,
-		clickID,
+		connID,
 		validClicks,
 		reservedClicks,
 	)
 
 	mu.Unlock()
+
+	// ------------------------------------------------------------
+	// Release reservation if validation does not complete.
+	// ------------------------------------------------------------
+	completed := false
+
+	defer func() {
+		if !completed && reservationHeld {
+			mu.Lock()
+			reservedClicks--
+			mu.Unlock()
+
+			log.Printf(
+				"RELEASED req=%d conn=%d reason=validation-failed",
+				reqID,
+				connID,
+			)
+		}
+	}()
 
 	// ------------------------------------------------------------
 	// One-second validation.
@@ -228,10 +254,12 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	select {
 	case <-r.Context().Done():
+		rememberFailedConnection(connID)
+
 		log.Printf(
-			"REJECT req=%d click=%q reason=disconnect-during-validation",
+			"REJECT req=%d conn=%d reason=disconnect-during-validation",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -244,10 +272,12 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	// Check for disconnect after validation.
 	// ------------------------------------------------------------
 	if err := r.Context().Err(); err != nil {
+		rememberFailedConnection(connID)
+
 		log.Printf(
-			"REJECT req=%d click=%q reason=disconnect-after-validation",
+			"REJECT req=%d conn=%d reason=disconnect-after-validation",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -255,14 +285,14 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	}
 
 	// ------------------------------------------------------------
-	// Read page.
+	// Read the page before counting.
 	// ------------------------------------------------------------
 	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Printf(
-			"ERROR req=%d click=%q reason=read-index err=%v",
+			"ERROR req=%d conn=%d reason=read-index err=%v",
 			reqID,
-			clickID,
+			connID,
 			err,
 		)
 
@@ -274,10 +304,12 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	// Final disconnect check.
 	// ------------------------------------------------------------
 	if err := r.Context().Err(); err != nil {
+		rememberFailedConnection(connID)
+
 		log.Printf(
-			"REJECT req=%d click=%q reason=disconnect-before-count",
+			"REJECT req=%d conn=%d reason=disconnect-before-count",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -285,7 +317,7 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	}
 
 	// ------------------------------------------------------------
-	// Convert reservation into one valid click.
+	// Count exactly once for THIS request.
 	// ------------------------------------------------------------
 	mu.Lock()
 
@@ -293,52 +325,51 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 		mu.Unlock()
 
 		log.Printf(
-			"REJECT req=%d click=%q reason=limit-reached-before-count",
+			"REJECT req=%d conn=%d reason=limit-reached-before-count",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Final check while holding the lock.
 	if err := r.Context().Err(); err != nil {
 		mu.Unlock()
 
+		rememberFailedConnection(connID)
+
 		log.Printf(
-			"REJECT req=%d click=%q reason=disconnect-before-increment",
+			"REJECT req=%d conn=%d reason=disconnect-before-increment",
 			reqID,
-			clickID,
+			connID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Convert reservation -> completed click.
 	reservedClicks--
+	reservationHeld = false
+
 	validClicks++
 
 	clickNumber := validClicks
-
-	// This click can never be counted again.
-	clicks[clickID] = clickCounted
 
 	mu.Unlock()
 
 	completed = true
 
 	log.Printf(
-		"VALID req=%d click=%q number=%d/%d",
+		"VALID req=%d conn=%d click=%d/%d",
 		reqID,
-		clickID,
+		connID,
 		clickNumber,
 		validClickLimit,
 	)
 
 	// ------------------------------------------------------------
-	// Send the page.
+	// Send actual page.
 	// ------------------------------------------------------------
 	w.Header().Set(
 		"Cache-Control",
@@ -353,9 +384,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	if _, err := w.Write(page); err != nil {
 		log.Printf(
-			"RESPONSE ERROR req=%d click=%q err=%v",
+			"RESPONSE ERROR req=%d conn=%d click=%d err=%v",
 			reqID,
-			clickID,
+			connID,
+			clickNumber,
 			err,
 		)
 	}
