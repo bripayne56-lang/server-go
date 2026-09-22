@@ -26,9 +26,6 @@ var (
 	// Successfully completed valid clicks.
 	validClicks int
 
-	// Clicks currently being validated.
-	reservedClicks int
-
 	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
 )
@@ -41,8 +38,6 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
-	// ONE AND ONLY PUBLIC CLICK ROUTE
-	//
 	// Only GET / can enter validation.
 	// Every other path returns 204 and does not count.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -59,11 +54,8 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// SERVE VALIDATED PAGE
-//
-// Reserves one of the 40 lifetime click slots,
-// waits one second, checks for disconnect,
-// then converts the reservation into one valid click.
+// Waits one second, checks for disconnect,
+// then converts the request into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
 	log.Printf(
 		"REQUEST: method=%s path=%s",
@@ -74,49 +66,13 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	// Limit simultaneous validations.
 	select {
 	case validationSemaphore <- struct{}{}:
+		defer func() {
+			<-validationSemaphore
+		}()
 	default:
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-
-	// Reserve a lifetime click slot.
-	mu.Lock()
-
-	if validClicks+reservedClicks >= validClickLimit {
-		mu.Unlock()
-
-		<-validationSemaphore
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	reservedClicks++
-
-	log.Printf(
-		"reserved click: completed=%d validating=%d",
-		validClicks,
-		reservedClicks,
-	)
-
-	mu.Unlock()
-
-	// Make sure the reservation is released if anything
-	// exits before the click is successfully completed.
-	completed := false
-
-	defer func() {
-		if !completed {
-			mu.Lock()
-			reservedClicks--
-			mu.Unlock()
-		}
-
-		<-validationSemaphore
-	}()
-
-	// Start timing the validation.
-	start := time.Now()
 
 	// One-second validation.
 	timer := time.NewTimer(validationTime)
@@ -124,39 +80,21 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	select {
 	case <-r.Context().Done():
-		log.Printf(
-			"CONTEXT DONE after %v",
-			time.Since(start),
-		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 
 	case <-timer.C:
-		log.Printf(
-			"TIMER FIRED after %v",
-			time.Since(start),
-		)
 	}
 
-	// Check whether the disconnect has been detected
-	// immediately after the timer finishes.
+	// Check for disconnect after the one-second validation.
 	if r.Context().Err() != nil {
-		log.Printf(
-			"CONTEXT CHECK: disconnected after timer at %v",
-			time.Since(start),
-		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	log.Printf(
-		"CONTEXT CHECK: still connected after timer at %v",
-		time.Since(start),
-	)
-
-	// Read the page before consuming the reservation.
+	// Read the page before consuming a valid-click slot.
 	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Println("failed to read index.html:", err)
@@ -164,19 +102,14 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 		return
 	}
 
-	// Check again immediately before converting the
-	// reservation into a valid click.
+	// Final disconnect check before counting.
 	if r.Context().Err() != nil {
-		log.Printf(
-			"CONTEXT CHECK: disconnected before count at %v",
-			time.Since(start),
-		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Convert this reservation into exactly one valid click.
+	// Convert this request into one valid click.
 	mu.Lock()
 
 	if validClicks >= validClickLimit {
@@ -186,33 +119,25 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 		return
 	}
 
-	// Final disconnect check while holding the mutex.
+	// Final disconnect check before incrementing.
 	if r.Context().Err() != nil {
 		mu.Unlock()
 
-		log.Printf(
-			"CONTEXT CHECK: disconnected at final count at %v",
-			time.Since(start),
-		)
 		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	reservedClicks--
 	validClicks++
 
 	clickNumber := validClicks
 
 	mu.Unlock()
 
-	completed = true
-
 	log.Printf(
-		"valid click %d/%d after %v",
+		"valid click %d/%d",
 		clickNumber,
 		validClickLimit,
-		time.Since(start),
 	)
 
 	// Send the actual page.
