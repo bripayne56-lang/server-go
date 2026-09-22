@@ -2,11 +2,11 @@ package main
 
 import (
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,9 +19,6 @@ const (
 
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
-
-	// Minimum time between requests from the same IP.
-	ipCooldown = 3 * time.Second
 )
 
 var (
@@ -36,8 +33,8 @@ var (
 	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
 
-	// Stores the most recent request time for each IP.
-	ipTrack sync.Map
+	// Used only to make log messages easy to correlate.
+	requestID atomic.Uint64
 )
 
 func main() {
@@ -67,48 +64,47 @@ func main() {
 // Waits one second, checks for disconnect,
 // then converts the request into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
+	id := requestID.Add(1)
+
 	log.Printf(
-		"REQUEST: method=%s path=%s",
+		"REQUEST id=%d method=%s path=%s",
+		id,
 		r.Method,
 		r.URL.Path,
 	)
 
-	// Get the client's source IP.
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		ip = r.RemoteAddr
-	}
-
-	// Reject requests from the same IP that arrive
-	// within the three-second cooldown period.
-	now := time.Now()
-
-	if lastRequest, found := ipTrack.Load(ip); found {
-		if now.Sub(lastRequest.(time.Time)) < ipCooldown {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-	}
-
-	// Record this request's arrival time.
-	ipTrack.Store(ip, now)
-
+	// ------------------------------------------------------------
 	// Limit simultaneous validations.
+	// ------------------------------------------------------------
 	select {
 	case validationSemaphore <- struct{}{}:
 		defer func() {
 			<-validationSemaphore
 		}()
 	default:
+		log.Printf(
+			"REJECT id=%d reason=validation-capacity",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	// ------------------------------------------------------------
 	// Reserve a lifetime click slot.
+	// ------------------------------------------------------------
 	mu.Lock()
 
 	if validClicks+reservedClicks >= validClickLimit {
 		mu.Unlock()
+
+		log.Printf(
+			"REJECT id=%d reason=click-limit completed=%d validating=%d",
+			id,
+			validClicks,
+			reservedClicks,
+		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -117,7 +113,8 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	reservedClicks++
 
 	log.Printf(
-		"reserved click: completed=%d validating=%d",
+		"RESERVED id=%d completed=%d validating=%d",
+		id,
 		validClicks,
 		reservedClicks,
 	)
@@ -133,59 +130,97 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 			mu.Lock()
 			reservedClicks--
 			mu.Unlock()
+
+			log.Printf(
+				"RELEASED id=%d reason=validation-failed",
+				id,
+			)
 		}
 	}()
 
+	// ------------------------------------------------------------
 	// One-second validation.
+	// ------------------------------------------------------------
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
 	case <-r.Context().Done():
-		log.Println("validation disconnected; click discarded")
+		log.Printf(
+			"REJECT id=%d reason=disconnect-during-validation",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 
 	case <-timer.C:
 	}
 
-	// Check for disconnect after the one-second validation.
-	if r.Context().Err() != nil {
-		log.Println("validation disconnected; click discarded")
+	// Check for disconnect after the validation period.
+	if err := r.Context().Err(); err != nil {
+		log.Printf(
+			"REJECT id=%d reason=disconnect-after-validation",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	// ------------------------------------------------------------
 	// Read the page before consuming the reservation.
+	// ------------------------------------------------------------
 	page, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Println("failed to read index.html:", err)
+		log.Printf(
+			"ERROR id=%d reason=read-index err=%v",
+			id,
+			err,
+		)
+
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	// Final disconnect check before counting.
-	if r.Context().Err() != nil {
-		log.Println("validation disconnected; click discarded")
+	if err := r.Context().Err(); err != nil {
+		log.Printf(
+			"REJECT id=%d reason=disconnect-before-count",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Convert the reservation into one valid click.
+	// ------------------------------------------------------------
+	// Convert reservation into one valid click.
+	// ------------------------------------------------------------
 	mu.Lock()
 
+	// Make sure the lifetime limit has not been reached.
 	if validClicks >= validClickLimit {
 		mu.Unlock()
 
+		log.Printf(
+			"REJECT id=%d reason=limit-reached-before-count",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Final disconnect check before incrementing.
-	if r.Context().Err() != nil {
+	// Final disconnect check while holding the click lock.
+	if err := r.Context().Err(); err != nil {
 		mu.Unlock()
 
-		log.Println("validation disconnected; click discarded")
+		log.Printf(
+			"REJECT id=%d reason=disconnect-before-increment",
+			id,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -200,12 +235,15 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	completed = true
 
 	log.Printf(
-		"valid click %d/%d",
+		"VALID id=%d click=%d/%d",
+		id,
 		clickNumber,
 		validClickLimit,
 	)
 
+	// ------------------------------------------------------------
 	// Send the actual page.
+	// ------------------------------------------------------------
 	w.Header().Set(
 		"Cache-Control",
 		"no-store, no-cache, must-revalidate, max-age=0",
@@ -216,7 +254,13 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(page)
+
+	if _, err := w.Write(page); err != nil {
+		log.Printf(
+			"RESPONSE ERROR id=%d click=%d err=%v",
+			id,
+			clickNumber,
+			err,
+		)
+	}
 }
-
-
