@@ -2,11 +2,9 @@ package main
 
 import (
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -20,10 +18,6 @@ const (
 
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
-
-	// How long an IP must wait after a successful click
-	// before it can count another click.
-	ipCooldown = 3 * time.Second
 )
 
 var (
@@ -37,9 +31,6 @@ var (
 
 	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
-
-	// Tracks the last successfully counted click for each IP.
-	ipTrack sync.Map
 )
 
 func main() {
@@ -50,120 +41,22 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
-	// HEALTH CHECK
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	})
-
-	// PRECHECK
-	// Waits one second but NEVER counts a click
-	// and NEVER sends HTML.
-	http.HandleFunc("/precheck", func(w http.ResponseWriter, r *http.Request) {
-		if !waitForPrecheck(r) {
+	// ONE AND ONLY PUBLIC CLICK ROUTE
+	//
+	// Only GET / can enter validation.
+	// Every other path returns 204 and does not count.
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/" {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	// ROOT
-	// ONLY "/" is allowed to enter the validation handler.
-	// Other paths are rejected and cannot consume a click.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			log.Printf(
-				"REJECTED PATH: method=%s path=%s",
-				r.Method,
-				r.URL.Path,
-			)
-			http.NotFound(w, r)
-			return
-		}
-
 		serveValidatedPage(w, r, filePath)
-	})
-
-	// VERIFY
-	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
-		serveValidatedPage(w, r, filePath)
-	})
-
-	// INDEX.HTML
-	http.HandleFunc("/index.html", func(w http.ResponseWriter, r *http.Request) {
-		serveValidatedPage(w, r, filePath)
-	})
-
-	// STATUS
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		completed := validClicks
-		reserved := reservedClicks
-		mu.Unlock()
-
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-
-		_, _ = w.Write([]byte(
-			"Completed: " + itoa(completed) +
-				"/" + itoa(validClickLimit) +
-				"\nValidating: " + itoa(reserved),
-		))
 	})
 
 	log.Println("Server running on port", port)
 
 	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
-
-// GET CLIENT IP
-//
-// Nginx forwards the original client IP in X-Forwarded-For.
-// If that header is unavailable, fall back to RemoteAddr.
-func getClientIP(r *http.Request) string {
-	forwarded := r.Header.Get("X-Forwarded-For")
-
-	if forwarded != "" {
-		// X-Forwarded-For can contain multiple addresses.
-		// The first address is the original client.
-		parts := strings.Split(forwarded, ",")
-
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-
-			if net.ParseIP(ip) != nil {
-				return ip
-			}
-		}
-	}
-
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return ip
-	}
-
-	return r.RemoteAddr
-}
-
-// PRECHECK
-//
-// Performs the one-second connection check.
-// It does NOT reserve or consume a click slot.
-func waitForPrecheck(r *http.Request) bool {
-	timer := time.NewTimer(validationTime)
-	defer timer.Stop()
-
-	select {
-	case <-r.Context().Done():
-		log.Println("precheck disconnected; no click counted")
-		return false
-
-	case <-timer.C:
-		return true
-	}
 }
 
 // SERVE VALIDATED PAGE
@@ -172,27 +65,11 @@ func waitForPrecheck(r *http.Request) bool {
 // waits one second, checks for disconnect,
 // then converts the reservation into one valid click.
 func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string) {
-	clientIP := getClientIP(r)
-
 	log.Printf(
-		"REQUEST: method=%s path=%s ip=%s",
+		"REQUEST: method=%s path=%s",
 		r.Method,
 		r.URL.Path,
-		clientIP,
 	)
-
-	// Check whether this IP recently completed a click.
-	if lastClickAt, found := ipTrack.Load(clientIP); found {
-		if time.Since(lastClickAt.(time.Time)) < ipCooldown {
-			log.Printf(
-				"IP COOLDOWN: ip=%s",
-				clientIP,
-			)
-
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-	}
 
 	// Limit simultaneous validations.
 	select {
@@ -216,6 +93,12 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	reservedClicks++
 
+	log.Printf(
+		"reserved click: completed=%d validating=%d",
+		validClicks,
+		reservedClicks,
+	)
+
 	mu.Unlock()
 
 	// Make sure the reservation is released if anything
@@ -238,10 +121,7 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	select {
 	case <-r.Context().Done():
-		log.Printf(
-			"validation disconnected; click discarded ip=%s",
-			clientIP,
-		)
+		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 
@@ -259,8 +139,9 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	// Convert this reservation into exactly one valid click.
 	mu.Lock()
 
-	if validClicks+reservedClicks > validClickLimit {
+	if validClicks >= validClickLimit {
 		mu.Unlock()
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -274,14 +155,10 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	completed = true
 
-	// Record the successful click time for this IP.
-	ipTrack.Store(clientIP, time.Now())
-
 	log.Printf(
-		"valid click %d/%d ip=%s",
+		"valid click %d/%d",
 		clickNumber,
 		validClickLimit,
-		clientIP,
 	)
 
 	// Send the actual page.
@@ -296,23 +173,5 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(page)
-}
-
-// SIMPLE INTEGER CONVERSION
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-
-	var buf [20]byte
-	i := len(buf)
-
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-
-	return string(buf[i:])
 }
 
