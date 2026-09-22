@@ -128,11 +128,28 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	case <-timer.C:
 	}
 
+	// IMPORTANT:
+	// Check the connection again immediately after the
+	// one-second timer finishes, before counting the click.
+	if r.Context().Err() != nil {
+		log.Println("validation disconnected; click discarded")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Read the page before consuming the reservation.
 	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Println("failed to read index.html:", err)
 		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Check again immediately before converting the
+	// reservation into a valid click.
+	if r.Context().Err() != nil {
+		log.Println("validation disconnected; click discarded")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -142,6 +159,15 @@ func serveValidatedPage(w http.ResponseWriter, r *http.Request, filePath string)
 	if validClicks >= validClickLimit {
 		mu.Unlock()
 
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Final disconnect check while holding the mutex.
+	if r.Context().Err() != nil {
+		mu.Unlock()
+
+		log.Println("validation disconnected; click discarded")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
