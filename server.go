@@ -17,7 +17,7 @@ const (
 	validationTime = 1 * time.Second
 
 	// Maximum number of valid clicks during this server process.
-	validClickLimit = 40
+	validClickLimit = 10
 
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
