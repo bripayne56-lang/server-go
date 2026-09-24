@@ -25,12 +25,19 @@ const (
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
 
-	// After a successful click, suppress an immediate follow-up
-	// GET / using the same client cookie.
+	// Prevent an immediate second GET / after a successful click
+	// from being counted as another click.
 	duplicateWindow = 1500 * time.Millisecond
 
-	// How long a served page has to send its acknowledgement.
-	ackTimeout = 10 * time.Second
+	// If a browser cancels a GET /, this is simply considered a
+	// failed attempt. A new GET / from the same cookie is allowed.
+	//
+	// This value is only used for logging the continuation.
+	retryWindow = 3 * time.Second
+
+	// After the page has been flushed, wait briefly before counting.
+	// This gives the server time to observe an immediate disconnect.
+	responseGrace = 150 * time.Millisecond
 
 	// Browser/client identifier cookie.
 	clientCookieName = "click_client_id"
@@ -45,15 +52,16 @@ const (
 type clientState struct {
 	mu sync.Mutex
 
-	// Only one GET / validation can be active for this browser ID.
+	// Only one GET / may be validating for this browser/client
+	// at a time.
 	inFlight bool
 
 	// Last time this client completed a valid click.
 	lastValid time.Time
 
-	// Exactly one page/attempt can be waiting for its ACK.
-	pendingToken string
-	pendingAt    time.Time
+	// If a browser disconnects during validation, the next GET /
+	// can be treated as a continuation of that navigation.
+	retryUntil time.Time
 }
 
 var (
@@ -65,7 +73,7 @@ var (
 	clickMu     sync.Mutex
 	validClicks int
 
-	// Limits simultaneous one-second validations.
+	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
 
 	requestID atomic.Uint64
@@ -80,20 +88,16 @@ func main() {
 	filePath := filepath.Join("public", "index.html")
 
 	// --------------------------------------------------------
-	// HTTP ROUTING
+	// ROUTING
 	// --------------------------------------------------------
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/__click_ack":
-			handleAck(w, r)
-
-		case r.Method == http.MethodGet && r.URL.Path == "/":
-			serveValidatedPage(w, r, filePath)
-
-		default:
+		if r.Method != http.MethodGet || r.URL.Path != "/" {
 			w.WriteHeader(http.StatusNoContent)
+			return
 		}
+
+		serveValidatedPage(w, r, filePath)
 	})
 
 	log.Println("Server running on port", port)
@@ -110,25 +114,17 @@ func main() {
 }
 
 // ------------------------------------------------------------
-// Random value generator.
+// Generate random browser/client ID.
 // ------------------------------------------------------------
 
-func newRandomHex(n int) (string, error) {
-	b := make([]byte, n)
+func newClientID() (string, error) {
+	var b [32]byte
 
-	if _, err := rand.Read(b); err != nil {
+	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
 
-	return hex.EncodeToString(b), nil
-}
-
-func newClientID() (string, error) {
-	return newRandomHex(32)
-}
-
-func newAttemptToken() (string, error) {
-	return newRandomHex(32)
+	return hex.EncodeToString(b[:]), nil
 }
 
 // ------------------------------------------------------------
@@ -171,22 +167,21 @@ func noStore(w http.ResponseWriter) {
 }
 
 // ------------------------------------------------------------
-// Bootstrap cookie with 307.
+// 307 COOKIE BOOTSTRAP
 //
-// This request does NOT:
-//   - validate
-//   - count
-//   - serve index.html
+// First GET / with no cookie:
+//     307 + Set-Cookie + Location: /
 //
-// Browser receives the cookie and follows the redirect,
-// producing the real GET / with the cookie.
+// Browser then makes GET / with the cookie.
+//
+// No page is served during the bootstrap.
 // ------------------------------------------------------------
 
 func bootstrapClient(
 	w http.ResponseWriter,
 	r *http.Request,
 	reqID uint64,
-) bool {
+) {
 	clientID, err := newClientID()
 
 	if err != nil {
@@ -202,7 +197,7 @@ func bootstrapClient(
 			http.StatusInternalServerError,
 		)
 
-		return false
+		return
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -224,12 +219,10 @@ func bootstrapClient(
 		reqID,
 		shortID(clientID),
 	)
-
-	return true
 }
 
 // ------------------------------------------------------------
-// Short log ID.
+// Shorten cookie ID in logs.
 // ------------------------------------------------------------
 
 func shortID(id string) string {
@@ -241,7 +234,50 @@ func shortID(id string) string {
 }
 
 // ------------------------------------------------------------
-// Get/create state for a client cookie.
+// Ignore browser speculative/prefetch requests.
+//
+// These requests are not user navigations and can be canceled
+// immediately when the real navigation begins.
+// They must NEVER enter validation.
+// ------------------------------------------------------------
+
+func isSpeculativeRequest(r *http.Request) bool {
+	purpose := strings.ToLower(
+		strings.TrimSpace(r.Header.Get("Purpose")),
+	)
+
+	secPurpose := strings.ToLower(
+		strings.TrimSpace(r.Header.Get("Sec-Purpose")),
+	)
+
+	if purpose == "prefetch" ||
+		strings.Contains(secPurpose, "prefetch") {
+		return true
+	}
+
+	// If Fetch Metadata headers are available, a real page load
+	// should be a document navigation.
+	dest := strings.ToLower(
+		strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")),
+	)
+
+	mode := strings.ToLower(
+		strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")),
+	)
+
+	if dest != "" && dest != "document" {
+		return true
+	}
+
+	if mode != "" && mode != "navigate" {
+		return true
+	}
+
+	return false
+}
+
+// ------------------------------------------------------------
+// Get/create browser state.
 // ------------------------------------------------------------
 
 func getClientState(clientID string) *clientState {
@@ -261,12 +297,19 @@ func getClientState(clientID string) *clientState {
 // ------------------------------------------------------------
 // Begin validation.
 //
-// A previous FAILED GET / does NOT block this request.
+// IMPORTANT:
 //
-// Only these can cause rejection:
-//   - another validation is already running
-//   - a page is currently waiting for ACK
-//   - this client just completed a valid click
+// A previous failed GET / does NOT block a new GET /.
+//
+// This is what allows:
+//
+//   req=1 -> browser cancels
+//   req=2 -> browser retries
+//
+// to work.
+//
+// Only an active request or a recent successful click blocks
+// another request.
 // ------------------------------------------------------------
 
 func beginValidation(state *clientState) (bool, string) {
@@ -275,127 +318,77 @@ func beginValidation(state *clientState) (bool, string) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
+	// Another GET / for this same browser is still active.
 	if state.inFlight {
 		return false, "validation-already-in-flight"
 	}
 
-	if state.pendingToken != "" {
-		if now.Sub(state.pendingAt) < ackTimeout {
-			return false, "awaiting-acknowledgement"
-		}
-
-		// ACK expired.
-		state.pendingToken = ""
-		state.pendingAt = time.Time{}
-	}
-
+	// A successful click just happened.
 	if !state.lastValid.IsZero() &&
 		now.Sub(state.lastValid) < duplicateWindow {
 		return false, "recently-succeeded"
 	}
 
+	// Determine whether this is a replacement for a request
+	// that was just canceled.
+	continuation := now.Before(state.retryUntil)
+
 	state.inFlight = true
 
-	return true, ""
+	if continuation {
+		return true, "continuation-after-disconnect"
+	}
+
+	return true, "new-validation"
 }
 
 // ------------------------------------------------------------
-// Mark a GET / validation as failed.
+// Validation failed.
 //
-// There is intentionally NO "lastFailed" state.
+// IMPORTANT:
 //
-// A failed GET / does not block a later GET /.
+// We do NOT permanently block the next GET /.
+//
+// Instead, we simply allow another GET / to take over.
 // ------------------------------------------------------------
 
-func failValidation(state *clientState) {
-	state.mu.Lock()
-	state.inFlight = false
-	state.mu.Unlock()
-}
-
-// ------------------------------------------------------------
-// Put a successfully prepared page into "awaiting ACK" state.
-// ------------------------------------------------------------
-
-func setPendingAck(
-	state *clientState,
-	token string,
-) {
+func finishFailedValidation(state *clientState) {
 	state.mu.Lock()
 
 	state.inFlight = false
-	state.pendingToken = token
-	state.pendingAt = time.Now()
+	state.retryUntil = time.Now().Add(retryWindow)
 
 	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
-// Cancel a pending ACK.
+// Validation succeeded.
+//
+// Called ONLY after the click has actually been committed.
 // ------------------------------------------------------------
 
-func cancelPendingAck(state *clientState) {
+func finishSuccessfulValidation(state *clientState) {
 	state.mu.Lock()
 
 	state.inFlight = false
-	state.pendingToken = ""
-	state.pendingAt = time.Time{}
-
-	state.mu.Unlock()
-}
-
-// ------------------------------------------------------------
-// Validate and consume the browser ACK token.
-//
-// The token must exactly match the currently pending page.
-// ------------------------------------------------------------
-
-func acknowledge(
-	state *clientState,
-	token string,
-) bool {
-	now := time.Now()
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	if state.pendingToken == "" {
-		return false
-	}
-
-	if state.pendingToken != token {
-		return false
-	}
-
-	if now.Sub(state.pendingAt) >= ackTimeout {
-		state.pendingToken = ""
-		state.pendingAt = time.Time{}
-		return false
-	}
-
-	// Consume token so it cannot be reused.
-	state.pendingToken = ""
-	state.pendingAt = time.Time{}
-
-	return true
-}
-
-// ------------------------------------------------------------
-// Mark client successful.
-// ------------------------------------------------------------
-
-func markClientSuccessful(state *clientState) {
-	state.mu.Lock()
+	state.retryUntil = time.Time{}
 	state.lastValid = time.Now()
+
 	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
 // Check actual completed click limit.
 //
+// IMPORTANT:
+//
 // ONLY validClicks matters.
 //
-// In-flight requests do NOT cause a 204.
+// No reservations.
+// No pending validations.
+// No in-flight requests.
+//
+// Therefore 4 completed + 6 validating can NEVER cause 204.
 // ------------------------------------------------------------
 
 func limitReached() bool {
@@ -406,7 +399,7 @@ func limitReached() bool {
 }
 
 // ------------------------------------------------------------
-// Get current valid click count.
+// Current completed click count.
 // ------------------------------------------------------------
 
 func validClickCount() int {
@@ -417,12 +410,11 @@ func validClickCount() int {
 }
 
 // ------------------------------------------------------------
-// Commit a valid click.
+// COMMIT A VALID CLICK.
 //
-// THIS IS THE ONLY PLACE validClicks IS INCREMENTED.
+// THIS IS THE ONLY PLACE validClicks++ EXISTS.
 //
-// GET / NEVER calls this directly.
-// Only /__click_ack reaches this function.
+// There is NO other path to incrementing the counter.
 // ------------------------------------------------------------
 
 func commitClick(reqID uint64) (bool, int) {
@@ -454,203 +446,7 @@ func commitClick(reqID uint64) (bool, int) {
 }
 
 // ------------------------------------------------------------
-// Create browser ACK JavaScript.
-//
-// The source public/index.html is NOT modified.
-// ------------------------------------------------------------
-
-func makeAckScript(token string) string {
-	return `<script>
-(function() {
-	var token = "` + token + `";
-	var body = "token=" + encodeURIComponent(token);
-
-	try {
-		if (navigator.sendBeacon) {
-			var blob = new Blob(
-				[body],
-				{type: "application/x-www-form-urlencoded;charset=UTF-8"}
-			);
-
-			if (navigator.sendBeacon("/__click_ack", blob)) {
-				return;
-			}
-		}
-	} catch (e) {}
-
-	try {
-		fetch("/__click_ack", {
-			method: "POST",
-			headers: {
-				"Content-Type":
-					"application/x-www-form-urlencoded;charset=UTF-8"
-			},
-			body: body,
-			keepalive: true,
-			credentials: "same-origin"
-		});
-	} catch (e) {}
-})();
-</script>`
-}
-
-// ------------------------------------------------------------
-// Inject ACK script before </body>.
-//
-// If no </body> exists, append the script.
-// ------------------------------------------------------------
-
-func injectAckScript(
-	page []byte,
-	token string,
-) []byte {
-	script := makeAckScript(token)
-
-	lower := strings.ToLower(string(page))
-
-	index := strings.LastIndex(
-		lower,
-		"</body>",
-	)
-
-	if index >= 0 {
-		out := make(
-			[]byte,
-			0,
-			len(page)+len(script),
-		)
-
-		out = append(
-			out,
-			page[:index]...,
-		)
-
-		out = append(
-			out,
-			script...,
-		)
-
-		out = append(
-			out,
-			page[index:]...,
-		)
-
-		return out
-	}
-
-	out := make(
-		[]byte,
-		0,
-		len(page)+len(script)+1,
-	)
-
-	out = append(out, page...)
-	out = append(out, script...)
-	out = append(out, '\n')
-
-	return out
-}
-
-// ------------------------------------------------------------
-// ACK endpoint.
-//
-// THIS is what makes a click valid.
-// ------------------------------------------------------------
-
-func handleAck(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	reqID := requestID.Add(1)
-
-	log.Printf(
-		"ACK-REQUEST req=%d method=%s path=%s",
-		reqID,
-		r.Method,
-		r.URL.Path,
-	)
-
-	// Only POST acknowledgements are accepted.
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	clientID, ok := getClientID(r)
-
-	if !ok {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if err := r.ParseForm(); err != nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	token := r.FormValue("token")
-
-	if token == "" {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	state := getClientState(clientID)
-
-	// Token must match the exact page currently awaiting ACK.
-	if !acknowledge(state, token) {
-		log.Printf(
-			"ACK-REJECT req=%d client=%s reason=invalid-or-expired-token",
-			reqID,
-			shortID(clientID),
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// ONLY NOW can the click become valid.
-	ok, clickNumber := commitClick(reqID)
-
-	if !ok {
-		log.Printf(
-			"ACK-NOT-COUNTED req=%d client=%s reason=click-limit",
-			reqID,
-			shortID(clientID),
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	markClientSuccessful(state)
-
-	log.Printf(
-		"ACK-VALID req=%d client=%s click=%d/%d",
-		reqID,
-		shortID(clientID),
-		clickNumber,
-		validClickLimit,
-	)
-
-	// ACK response intentionally returns no content.
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ------------------------------------------------------------
-// GET / validation.
-//
-// IMPORTANT:
-//
-// GET / NEVER increments validClicks.
-//
-// It can only:
-//   - bootstrap cookie
-//   - reject
-//   - wait one second
-//   - serve the page
-//
-// The browser ACK is what counts the click.
+// SERVE VALIDATED PAGE
 // ------------------------------------------------------------
 
 func serveValidatedPage(
@@ -668,7 +464,21 @@ func serveValidatedPage(
 	)
 
 	// --------------------------------------------------------
-	// 204 ONLY when the actual completed lifetime limit is reached.
+	// Ignore speculative browser requests.
+	// --------------------------------------------------------
+
+	if isSpeculativeRequest(r) {
+		log.Printf(
+			"REJECT req=%d reason=speculative-request",
+			reqID,
+		)
+
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// --------------------------------------------------------
+	// 204 ONLY when the actual completed limit is reached.
 	// --------------------------------------------------------
 
 	if limitReached() {
@@ -702,35 +512,45 @@ func serveValidatedPage(
 	state := getClientState(clientID)
 
 	// --------------------------------------------------------
-	// DUPLICATE PROTECTION
+	// ONE ACTIVE GET / PER CLIENT
 	// --------------------------------------------------------
 
-	ok, reason := beginValidation(state)
+	allowed, mode := beginValidation(state)
 
-	if !ok {
+	if !allowed {
 		log.Printf(
 			"REJECT req=%d client=%s reason=%s",
 			reqID,
 			shortID(clientID),
-			reason,
+			mode,
 		)
 
-		// Duplicate/rejected requests can return 204.
-		// They NEVER call commitClick().
+		// Duplicate requests can return 204.
+		// They DO NOT count.
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
 
-	validationActive := true
+	log.Printf(
+		"VALIDATING req=%d client=%s mode=%s",
+		reqID,
+		shortID(clientID),
+		mode,
+	)
+
+	// Assume failure until the final commit succeeds.
+	successful := false
 
 	defer func() {
-		if validationActive {
-			failValidation(state)
+		if !successful {
+			finishFailedValidation(state)
 
 			log.Printf(
-				"FAILED req=%d client=%s",
+				"FAILED req=%d client=%s retry-window=%s",
 				reqID,
 				shortID(clientID),
+				retryWindow,
 			)
 		}
 	}()
@@ -752,12 +572,14 @@ func serveValidatedPage(
 			shortID(clientID),
 		)
 
+		// Not a valid click.
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
 
 	// --------------------------------------------------------
-	// ONE-SECOND VALIDATION
+	// FULL ONE-SECOND VALIDATION
 	// --------------------------------------------------------
 
 	timer := time.NewTimer(validationTime)
@@ -765,20 +587,21 @@ func serveValidatedPage(
 
 	select {
 	case <-r.Context().Done():
+
 		log.Printf(
 			"REJECT req=%d client=%s reason=disconnect-during-validation",
 			reqID,
 			shortID(clientID),
 		)
 
-		// This request cannot count.
+		// No commit.
 		return
 
 	case <-timer.C:
 	}
 
 	// --------------------------------------------------------
-	// Check cancellation immediately after one second.
+	// Cancellation check after one second.
 	// --------------------------------------------------------
 
 	if err := r.Context().Err(); err != nil {
@@ -805,6 +628,7 @@ func serveValidatedPage(
 		)
 
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
 
@@ -822,11 +646,12 @@ func serveValidatedPage(
 		)
 
 		w.WriteHeader(http.StatusInternalServerError)
+
 		return
 	}
 
 	// --------------------------------------------------------
-	// Check cancellation before response.
+	// Check again before response.
 	// --------------------------------------------------------
 
 	if err := r.Context().Err(); err != nil {
@@ -848,38 +673,9 @@ func serveValidatedPage(
 		)
 
 		w.WriteHeader(http.StatusNoContent)
+
 		return
 	}
-
-	// --------------------------------------------------------
-	// Create unique acknowledgement token.
-	// --------------------------------------------------------
-
-	token, err := newAttemptToken()
-
-	if err != nil {
-		log.Printf(
-			"ERROR req=%d reason=attempt-token-generation err=%v",
-			reqID,
-			err,
-		)
-
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	// Inject ACK script into response.
-	//
-	// The original public/index.html file is NOT modified.
-	page = injectAckScript(page, token)
-
-	// --------------------------------------------------------
-	// Register token BEFORE sending page.
-	// --------------------------------------------------------
-
-	setPendingAck(state, token)
-
-	validationActive = false
 
 	// --------------------------------------------------------
 	// RESPONSE HEADERS
@@ -898,14 +694,13 @@ func serveValidatedPage(
 	)
 
 	// --------------------------------------------------------
-	// SERVE PAGE.
+	// SEND INDEX.HTML
 	//
-	// STILL NOT COUNTED.
+	// IMPORTANT:
+	// This still does NOT immediately count the click.
 	// --------------------------------------------------------
 
 	if _, err := w.Write(page); err != nil {
-		cancelPendingAck(state)
-
 		log.Printf(
 			"REJECT req=%d client=%s reason=response-write-failed err=%v",
 			reqID,
@@ -917,12 +712,10 @@ func serveValidatedPage(
 	}
 
 	// --------------------------------------------------------
-	// FLUSH RESPONSE.
+	// FLUSH THE RESPONSE
 	// --------------------------------------------------------
 
 	if err := http.NewResponseController(w).Flush(); err != nil {
-		cancelPendingAck(state)
-
 		log.Printf(
 			"REJECT req=%d client=%s reason=response-flush-failed err=%v",
 			reqID,
@@ -933,17 +726,81 @@ func serveValidatedPage(
 		return
 	}
 
-	// --------------------------------------------------------
-	// GET / is finished.
-	//
-	// It is NOT valid yet.
-	//
-	// It is waiting for /__click_ack.
-	// --------------------------------------------------------
-
 	log.Printf(
-		"PAGE-SENT req=%d client=%s awaiting-ack",
+		"PAGE-SENT req=%d client=%s",
 		reqID,
 		shortID(clientID),
+	)
+
+	// --------------------------------------------------------
+	// IMPORTANT:
+	//
+	// Keep this request marked inFlight during this period.
+	//
+	// Therefore another GET / from the same cookie cannot sneak
+	// through and become another click while this request is
+	// finishing.
+	// --------------------------------------------------------
+
+	graceTimer := time.NewTimer(responseGrace)
+	defer graceTimer.Stop()
+
+	select {
+	case <-r.Context().Done():
+
+		log.Printf(
+			"REJECT req=%d client=%s reason=disconnect-after-response",
+			reqID,
+			shortID(clientID),
+		)
+
+		// No commit.
+		return
+
+	case <-graceTimer.C:
+	}
+
+	// --------------------------------------------------------
+	// FINAL CANCELLATION CHECK
+	// --------------------------------------------------------
+
+	if err := r.Context().Err(); err != nil {
+		log.Printf(
+			"REJECT req=%d client=%s reason=disconnect-final err=%v",
+			reqID,
+			shortID(clientID),
+			err,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// FINAL COMMIT.
+	//
+	// ONLY HERE can the click become valid.
+	// --------------------------------------------------------
+
+	ok, clickNumber := commitClick(reqID)
+
+	if !ok {
+		// Another request reached the limit first.
+		//
+		// Do not count this request.
+		return
+	}
+
+	// Mark this browser/client successful only AFTER the
+	// click has actually been counted.
+	finishSuccessfulValidation(state)
+
+	successful = true
+
+	log.Printf(
+		"COMPLETED req=%d client=%s click=%d/%d",
+		reqID,
+		shortID(clientID),
+		clickNumber,
+		validClickLimit,
 	)
 }
