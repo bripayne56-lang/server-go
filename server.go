@@ -2,301 +2,254 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	// How long validation must last.
-	validationTime = 1 * time.Second
-
-	// Maximum number of valid clicks during this server process.
-	validClickLimit = 10
-
-	// Maximum number of validations happening at once.
+	validationTime    = 1 * time.Second
+	validClickLimit   = 10
 	maxConcurrentWaits = 50
-
-	// Suppress an immediate follow-up GET / on the same
-	// persistent HTTP connection after a successful click.
-	//
-	// This is NOT IP rate limiting.
-	duplicateWindow = 1500 * time.Millisecond
 )
 
-// Every persistent HTTP connection gets its own state.
-// No IP address is stored or examined.
-type connectionState struct {
-	mu sync.Mutex
+type contextKey struct{}
 
-	// When the last successful click on this connection
-	// was completed.
-	lastValid time.Time
+var connectionStateKey contextKey
+
+type connectionState struct {
+	id   uint64
+	slot chan struct{}
 }
 
-type connectionStateKey struct{}
-
 var (
-	mu sync.Mutex
-
-	// Successfully completed valid clicks.
 	validClicks int
 
-	// Clicks currently being validated.
-	reservedClicks int
+	countMu sync.Mutex
 
-	// Limits simultaneous validations.
-	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
+	// Serializes the final response/count operation.
+	// This prevents two requests from racing for the last
+	// available lifetime click.
+	commitMu sync.Mutex
 
-	requestID atomic.Uint64
+	// Maximum number of requests that can be in the 1-second
+	// validation phase at once.
+	validationSem = make(chan struct{}, maxConcurrentWaits)
+
+	requestSeq   atomic.Uint64
+	connectionSeq atomic.Uint64
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	page, err := os.ReadFile("public/index.html")
+	if err != nil {
+		log.Fatalf("failed to read public/index.html: %v", err)
 	}
 
-	filePath := filepath.Join("public", "index.html")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		reqID := requestSeq.Add(1)
 
-	server := &http.Server{
-		Addr: ":" + port,
-
-		// Assign state to each TCP connection.
-		//
-		// No IP address is used.
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			state := &connectionState{}
-
-			return context.WithValue(
-				ctx,
-				connectionStateKey{},
-				state,
+		if r.Method != http.MethodGet {
+			log.Printf(
+				"REJECT req=%d method=%s path=%s reason=method-not-allowed",
+				reqID, r.Method, r.URL.Path,
 			)
-		},
-	}
-
-	// Only GET / can enter validation.
-	// Every other path returns 204 and does not count.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/" {
-			w.WriteHeader(http.StatusNoContent)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		serveValidatedPage(w, r, filePath)
+		if r.URL.Path != "/" {
+			log.Printf(
+				"REJECT req=%d method=%s path=%s reason=not-found",
+				reqID, r.Method, r.URL.Path,
+			)
+			http.NotFound(w, r)
+			return
+		}
+
+		serveValidatedPage(w, r, page, reqID)
 	})
 
-	log.Println("Server running on port", port)
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+
+		// This gives dead/broken clients a finite write window.
+		WriteTimeout: 15 * time.Second,
+
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			connID := connectionSeq.Add(1)
+
+			state := &connectionState{
+				id:   connID,
+				slot: make(chan struct{}, 1),
+			}
+
+			// One token means one active request on this
+			// connection at a time.
+			state.slot <- struct{}{}
+
+			return context.WithValue(ctx, connectionStateKey, state)
+		},
+	}
+
+	log.Printf(
+		"server starting on %s validation=%s validLimit=%d maxConcurrent=%d",
+		server.Addr,
+		validationTime,
+		validClickLimit,
+		maxConcurrentWaits,
+	)
 
 	log.Fatal(server.ListenAndServe())
 }
 
-func getConnectionState(r *http.Request) *connectionState {
-	state, ok := r.Context().
-		Value(connectionStateKey{}).
-		(*connectionState)
-
-	if !ok {
-		// ConnContext should always provide this.
-		// Return a private fallback rather than panic.
-		return &connectionState{}
-	}
-
-	return state
-}
-
-// recentlySucceeded checks whether this connection just
-// completed a valid click.
-//
-// This does NOT use an IP address.
-func recentlySucceeded(state *connectionState) bool {
-	now := time.Now()
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	if state.lastValid.IsZero() {
-		return false
-	}
-
-	if now.Sub(state.lastValid) >= duplicateWindow {
-		return false
-	}
-
-	return true
-}
-
-func markSuccessfulConnection(state *connectionState) {
-	state.mu.Lock()
-	state.lastValid = time.Now()
-	state.mu.Unlock()
-}
-
-// serveValidatedPage waits one second, verifies the request
-// remained alive, sends the page, flushes the response,
-// and only then commits the click.
 func serveValidatedPage(
 	w http.ResponseWriter,
 	r *http.Request,
-	filePath string,
+	page []byte,
+	reqID uint64,
 ) {
-	reqID := requestID.Add(1)
-	connState := getConnectionState(r)
+	state, _ := r.Context().Value(connectionStateKey).(*connectionState)
 
-	log.Printf(
-		"REQUEST req=%d method=%s path=%s",
-		reqID,
-		r.Method,
-		r.URL.Path,
-	)
+	connID := uint64(0)
+	if state != nil {
+		connID = state.id
 
-	// ------------------------------------------------------------
-	// Prevent the immediate duplicate request pattern:
-	//
-	//   req=15 -> VALID
-	//   req=16 -> GET /
-	//
-	// when req=16 arrives immediately after the successful
-	// response on the same persistent connection.
-	//
-	// This is connection-based only.
-	// ------------------------------------------------------------
-	if recentlySucceeded(connState) {
-		log.Printf(
-			"REJECT req=%d reason=duplicate-same-connection",
-			reqID,
-		)
+		// Serialize all requests on this connection.
+		//
+		// This is important because the browser can send another
+		// GET on the same persistent connection while the previous
+		// request is finishing/canceling.
+		select {
+		case <-state.slot:
+			defer func() {
+				state.slot <- struct{}{}
+			}()
 
-		w.WriteHeader(http.StatusNoContent)
-		return
+		case <-r.Context().Done():
+			log.Printf(
+				"REJECT req=%d conn=%d reason=disconnect-waiting-for-connection-slot",
+				reqID, connID,
+			)
+			return
+		}
 	}
 
-	// ------------------------------------------------------------
-	// Limit simultaneous validations.
-	// ------------------------------------------------------------
+	log.Printf("REQUEST req=%d conn=%d", reqID, connID)
+
+	// IMPORTANT:
+	// Do NOT return 204 if all 50 validation slots are busy.
+	// Instead, wait for one. A busy validation pool is NOT
+	// the lifetime click limit.
 	select {
-	case validationSemaphore <- struct{}{}:
+	case validationSem <- struct{}{}:
 		defer func() {
-			<-validationSemaphore
+			<-validationSem
+			log.Printf(
+				"RELEASED req=%d conn=%d",
+				reqID, connID,
+			)
 		}()
 
-	default:
 		log.Printf(
-			"REJECT req=%d reason=validation-capacity",
-			reqID,
+			"RESERVED req=%d conn=%d",
+			reqID, connID,
 		)
 
-		w.WriteHeader(http.StatusNoContent)
+	case <-r.Context().Done():
+		log.Printf(
+			"REJECT req=%d conn=%d reason=disconnect-before-validation",
+			reqID, connID,
+		)
 		return
 	}
 
 	// ------------------------------------------------------------
-	// Reserve one of the 40 lifetime click slots.
+	// 1 SECOND VALIDATION
 	// ------------------------------------------------------------
-	mu.Lock()
 
-	if validClicks+reservedClicks >= validClickLimit {
-		mu.Unlock()
-
-		log.Printf(
-			"REJECT req=%d reason=click-limit completed=%d validating=%d",
-			reqID,
-			validClicks,
-			reservedClicks,
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	reservedClicks++
-	reservationHeld := true
-
-	log.Printf(
-		"RESERVED req=%d completed=%d validating=%d",
-		reqID,
-		validClicks,
-		reservedClicks,
-	)
-
-	mu.Unlock()
-
-	// If validation fails, the reservation is returned.
-	completed := false
-
-	defer func() {
-		if !completed && reservationHeld {
-			mu.Lock()
-			reservedClicks--
-			mu.Unlock()
-
-			log.Printf(
-				"RELEASED req=%d reason=validation-failed",
-				reqID,
-			)
-		}
-	}()
-
-	// ------------------------------------------------------------
-	// One-second validation.
-	// ------------------------------------------------------------
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
+	case <-timer.C:
+		// Continue.
+
 	case <-r.Context().Done():
 		log.Printf(
-			"REJECT req=%d reason=disconnect-during-validation",
-			reqID,
+			"REJECT req=%d conn=%d reason=disconnect-during-validation",
+			reqID, connID,
 		)
-
-		w.WriteHeader(http.StatusNoContent)
 		return
-
-	case <-timer.C:
 	}
 
-	// ------------------------------------------------------------
-	// Check immediately after validation.
-	// ------------------------------------------------------------
+	// Check again immediately after the timer.
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=disconnect-after-validation",
-			reqID,
+			"REJECT req=%d conn=%d reason=disconnect-after-validation err=%v",
+			reqID, connID, err,
 		)
-
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Read index.html before the reservation is consumed.
-	// ------------------------------------------------------------
-	page, err := os.ReadFile(filePath)
-	if err != nil {
+	// Load the page before entering the final commit section.
+	// The page is already loaded into memory in main(), so this is cheap.
+	if len(page) == 0 {
 		log.Printf(
-			"ERROR req=%d reason=read-index err=%v",
-			reqID,
-			err,
+			"REJECT req=%d conn=%d reason=empty-page",
+			reqID, connID,
 		)
-
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "empty page", http.StatusInternalServerError)
 		return
 	}
 
 	// ------------------------------------------------------------
-	// Check again before writing.
+	// FINAL COMMIT
 	// ------------------------------------------------------------
+	//
+	// Only one request at a time is allowed into this section.
+	//
+	// That guarantees:
+	//   - no two requests can both consume the same final slot
+	//   - validClicks cannot unexpectedly change between the
+	//     limit check and the count
+	//   - 204 means the actual counter is at the limit
+	//
+	commitMu.Lock()
+	defer commitMu.Unlock()
+
+	// The client might have disconnected while we were waiting
+	// for commitMu.
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=disconnect-before-response",
+			"REJECT req=%d conn=%d reason=disconnect-before-response",
+			reqID, connID,
+		)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// THE ONLY 204 PATH IN THIS PROGRAM
+	// ------------------------------------------------------------
+
+	countMu.Lock()
+	current := validClicks
+	countMu.Unlock()
+
+	if current >= validClickLimit {
+		log.Printf(
+			"204 req=%d conn=%d reason=lifetime-limit click=%d/%d",
 			reqID,
+			connID,
+			current,
+			validClickLimit,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
@@ -304,116 +257,93 @@ func serveValidatedPage(
 	}
 
 	// ------------------------------------------------------------
-	// Set response headers.
+	// SEND THE RESPONSE FIRST
 	// ------------------------------------------------------------
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set(
-		"Content-Type",
-		"text/html; charset=utf-8",
-	)
-	w.Header().Set(
-		"X-Content-Type-Options",
-		"nosniff",
-	)
+	//
+	// We do NOT increment validClicks until the response has been
+	// successfully written/flushed and the request context is still
+	// alive.
+	//
+	// Therefore a normal early disconnect should never become a
+	// valid click.
+	// ------------------------------------------------------------
 
-	// ------------------------------------------------------------
-	// Send the page BEFORE counting the click.
-	// ------------------------------------------------------------
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(page)))
+
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := w.Write(page); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=response-write-failed err=%v",
+			"REJECT req=%d conn=%d reason=response-write-failed err=%v",
 			reqID,
+			connID,
 			err,
 		)
-
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Explicitly flush the response.
-	//
-	// This gives net/http a chance to surface a broken connection
-	// before the click is committed.
-	// ------------------------------------------------------------
+	// Force net/http to push the response now where supported.
 	rc := http.NewResponseController(w)
 
 	if err := rc.Flush(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=response-flush-failed err=%v",
+			"REJECT req=%d conn=%d reason=response-flush-failed err=%v",
 			reqID,
+			connID,
 			err,
 		)
-
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Final request cancellation check.
-	// ------------------------------------------------------------
+	// Final disconnect check immediately before counting.
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=disconnect-after-response",
+			"REJECT req=%d conn=%d reason=disconnect-after-response err=%v",
 			reqID,
+			connID,
+			err,
 		)
-
 		return
 	}
 
 	// ------------------------------------------------------------
-	// Now, and only now, convert the reservation into
-	// a valid click.
+	// COUNT EXACTLY ONCE
 	// ------------------------------------------------------------
-	mu.Lock()
 
-	// Another validation could have consumed the final slot.
+	countMu.Lock()
+
+	// commitMu guarantees another request cannot change the count
+	// while we're doing this finalization.
 	if validClicks >= validClickLimit {
-		mu.Unlock()
+		countMu.Unlock()
 
+		// This should normally be impossible because commitMu
+		// serializes the final section, but keep the guard anyway.
 		log.Printf(
-			"REJECT req=%d reason=limit-reached-before-count",
+			"204 req=%d conn=%d reason=lifetime-limit-race click=%d/%d",
 			reqID,
+			connID,
+			validClicks,
+			validClickLimit,
 		)
 
 		return
 	}
-
-	// One final cancellation check while holding the click lock.
-	if err := r.Context().Err(); err != nil {
-		mu.Unlock()
-
-		log.Printf(
-			"REJECT req=%d reason=disconnect-before-increment",
-			reqID,
-		)
-
-		return
-	}
-
-	// Reservation -> completed click.
-	reservedClicks--
-	reservationHeld = false
 
 	validClicks++
 	clickNumber := validClicks
 
-	mu.Unlock()
-
-	completed = true
-
-	// Record the successful request on this connection.
-	markSuccessfulConnection(connState)
+	countMu.Unlock()
 
 	log.Printf(
-		"VALID req=%d click=%d/%d",
+		"VALID req=%d conn=%d click=%d/%d",
 		reqID,
+		connID,
 		clickNumber,
 		validClickLimit,
 	)
+
+	// No other code path increments validClicks.
+	// This request is done.
 }
