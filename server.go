@@ -1,461 +1,117 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
-	"encoding/hex"
+	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	// How long validation must last.
-	validationTime = 1 * time.Second
-
-	// Maximum number of valid clicks during this server process.
-	validClickLimit = 10
-
-	// Maximum number of validations happening at once.
+	validationTime    = 1 * time.Second
+	validClickLimit   = 10 
 	maxConcurrentWaits = 50
-
-	// After a successful click OR failed validation, suppress
-	// an immediate follow-up GET / using the same client cookie.
-	duplicateWindow = 1500 * time.Millisecond
-
-	// Browser/client identifier cookie.
-	clientCookieName = "click_client_id"
+	duplicateWindow   = 1500 * time.Millisecond
 )
 
-// State belongs to a browser/client cookie.
-//
-// This replaces the old TCP-connection-based state.
-//
-// No IP address is stored or examined.
+var (
+	validClicks  int64
+	reservedClicks int64
+	requestID    int64
+
+	waitSlots = make(chan struct{}, maxConcurrentWaits)
+
+	page []byte
+
+	clientsMu sync.Mutex
+	clients   = make(map[string]*clientState)
+)
+
 type clientState struct {
-	mu sync.Mutex
-
-	// A validation is currently running for this client.
-	inFlight bool
-
-	// Time when this client last completed a valid click.
-	lastValid time.Time
-
-	// Time when this client's most recent validation failed.
-	//
-	// This is important for the problem you showed:
-	//
-	// req=1 -> disconnect -> rejected
-	// req=2 -> immediate GET / with same cookie
-	//
-	// req=2 will be rejected rather than becoming another click.
+	mu         sync.Mutex
+	inFlight   bool
 	lastFailed time.Time
 }
 
-var (
-	// Protects the clientStates map.
-	clientStatesMu sync.Mutex
+// ---------- Client cookie ----------
 
-	// Client state keyed by the random browser cookie.
-	clientStates = make(map[string]*clientState)
-
-	// Protects validClicks and reservedClicks.
-	mu sync.Mutex
-
-	// Successfully completed valid clicks.
-	validClicks int
-
-	// Clicks currently being validated.
-	reservedClicks int
-
-	// Limits simultaneous validations.
-	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
-
-	requestID atomic.Uint64
-)
-
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+func newClientID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Extremely unlikely, but don't continue with a predictable ID.
+		panic(err)
 	}
 
-	filePath := filepath.Join("public", "index.html")
-
-	// ------------------------------------------------------------
-	// GET /
-	// ------------------------------------------------------------
-	//
-	// Only GET / enters the one-second validation flow.
-	//
-	// The first-ever GET / has no cookie, so we bootstrap the
-	// cookie with a 307 redirect. The browser then makes another
-	// GET / containing the cookie.
-	//
-	// index.html is NOT served during the bootstrap.
-	// ------------------------------------------------------------
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		serveValidatedPage(w, r, filePath)
-	})
-
-	log.Println("Server running on port", port)
-
-	server := &http.Server{
-		Addr: ":" + port,
-
-		// Keep connection context available even though client
-		// identity is now cookie-based.
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return ctx
-		},
-	}
-
-	log.Fatal(server.ListenAndServe())
+	return fmt.Sprintf("%x", b)
 }
-
-// ------------------------------------------------------------
-// Generate a random browser/client ID.
-// ------------------------------------------------------------
-
-func newClientID() (string, error) {
-	var b [32]byte
-
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(b[:]), nil
-}
-
-// ------------------------------------------------------------
-// Determine whether the incoming request is HTTPS.
-//
-// This allows Secure cookies to work both when Go is directly
-// serving HTTPS and when HTTPS is terminated by a proxy.
-// ------------------------------------------------------------
-
-func requestIsHTTPS(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-
-	return r.Header.Get("X-Forwarded-Proto") == "https"
-}
-
-// ------------------------------------------------------------
-// Get or create the browser/client cookie.
-//
-// Returns:
-//
-//   clientID
-//   hasCookie
-//
-// When no cookie exists, this function DOES NOT start validation.
-// The caller must issue the bootstrap redirect.
-// ------------------------------------------------------------
-
-func getClientID(r *http.Request) (string, bool) {
-	cookie, err := r.Cookie(clientCookieName)
-
-	if err != nil || cookie.Value == "" {
-		return "", false
-	}
-
-	return cookie.Value, true
-}
-
-// ------------------------------------------------------------
-// Create a cookie and immediately redirect back to /.
-//
-// This is the bootstrap step:
-//
-// GET /
-//   ↓
-// 307 + Set-Cookie
-//   ↓
-// browser follows redirect
-//   ↓
-// GET / + Cookie
-// ------------------------------------------------------------
-
-func bootstrapClient(
-	w http.ResponseWriter,
-	r *http.Request,
-	reqID uint64,
-) bool {
-	clientID, err := newClientID()
-	if err != nil {
-		log.Printf(
-			"ERROR req=%d reason=client-id-generation err=%v",
-			reqID,
-			err,
-		)
-
-		http.Error(
-			w,
-			"internal server error",
-			http.StatusInternalServerError,
-		)
-
-		return false
-	}
-
-	secure := requestIsHTTPS(r)
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     clientCookieName,
-		Value:    clientID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   secure,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-
-	// Redirect back to the exact same GET /.
-	w.Header().Set("Location", "/")
-	w.WriteHeader(http.StatusTemporaryRedirect)
-
-	log.Printf(
-		"BOOTSTRAP req=%d cookie-issued client=%s secure=%t",
-		reqID,
-		shortID(clientID),
-		secure,
-	)
-
-	return true
-}
-
-// ------------------------------------------------------------
-// Shorten IDs in logs so the complete cookie value is not dumped.
-// ------------------------------------------------------------
-
-func shortID(id string) string {
-	if len(id) <= 8 {
-		return id
-	}
-
-	return id[:8]
-}
-
-// ------------------------------------------------------------
-// Get client state.
-//
-// This state survives TCP connection changes because it is keyed
-// by the browser cookie instead of net.Conn.
-// ------------------------------------------------------------
 
 func getClientState(clientID string) *clientState {
-	clientStatesMu.Lock()
-	defer clientStatesMu.Unlock()
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
 
-	state, ok := clientStates[clientID]
-
+	state, ok := clients[clientID]
 	if !ok {
 		state = &clientState{}
-		clientStates[clientID] = state
+		clients[clientID] = state
 	}
 
 	return state
 }
 
-// ------------------------------------------------------------
-// Begin validation for a client.
-//
-// Reject when:
-//
-// 1. Another validation is already running.
-// 2. The client just completed a valid click.
-// 3. The client just failed a validation.
-//
-// The third case specifically prevents:
-//
-// req=1 -> early disconnect
-// req=2 -> immediate retry
-//
-// from turning req=2 into a valid click.
-// ------------------------------------------------------------
+// ---------- Click reservation ----------
 
-func beginValidation(state *clientState) (bool, string) {
-	now := time.Now()
+func reserveClick() bool {
+	for {
+		completed := atomic.LoadInt64(&validClicks)
+		reserved := atomic.LoadInt64(&reservedClicks)
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
+		if completed+reserved >= validClickLimit {
+			return false
+		}
 
-	if state.inFlight {
-		return false, "validation-already-in-flight"
+		if atomic.CompareAndSwapInt64(
+			&reservedClicks,
+			reserved,
+			reserved+1,
+		) {
+			return true
+		}
 	}
-
-	if !state.lastValid.IsZero() &&
-		now.Sub(state.lastValid) < duplicateWindow {
-		return false, "recently-succeeded"
-	}
-
-	if !state.lastFailed.IsZero() &&
-		now.Sub(state.lastFailed) < duplicateWindow {
-		return false, "recently-failed"
-	}
-
-	state.inFlight = true
-
-	return true, ""
 }
 
-// ------------------------------------------------------------
-// Finish validation and record the result for this client.
-// ------------------------------------------------------------
-
-func finishValidation(
-	state *clientState,
-	successful bool,
-) {
-	now := time.Now()
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	state.inFlight = false
-
-	if successful {
-		state.lastValid = now
-		state.lastFailed = time.Time{}
-		return
-	}
-
-	state.lastFailed = now
+func releaseReservation() {
+	atomic.AddInt64(&reservedClicks, -1)
 }
 
-// ------------------------------------------------------------
-// Reserve a lifetime click slot.
-//
-// This preserves your existing 40-click limit semantics.
-// ------------------------------------------------------------
+func commitClick() (int64, bool) {
+	atomic.AddInt64(&reservedClicks, -1)
 
-func reserveClick(reqID uint64) bool {
-	mu.Lock()
-	defer mu.Unlock()
+	for {
+		current := atomic.LoadInt64(&validClicks)
 
-	if validClicks+reservedClicks >= validClickLimit {
-		log.Printf(
-			"REJECT req=%d reason=click-limit completed=%d validating=%d",
-			reqID,
-			validClicks,
-			reservedClicks,
-		)
+		if current >= validClickLimit {
+			return current, false
+		}
 
-		return false
+		if atomic.CompareAndSwapInt64(
+			&validClicks,
+			current,
+			current+1,
+		) {
+			return current + 1, true
+		}
 	}
-
-	reservedClicks++
-
-	log.Printf(
-		"RESERVED req=%d completed=%d validating=%d",
-		reqID,
-		validClicks,
-		reservedClicks,
-	)
-
-	return true
 }
 
-// ------------------------------------------------------------
-// Release a reservation after validation fails.
-// ------------------------------------------------------------
+// ---------- Main handler ----------
 
-func releaseReservation(
-	reqID uint64,
-	reason string,
-) {
-	mu.Lock()
-
-	if reservedClicks > 0 {
-		reservedClicks--
-	}
-
-	mu.Unlock()
-
-	log.Printf(
-		"RELEASED req=%d reason=%s",
-		reqID,
-		reason,
-	)
-}
-
-// ------------------------------------------------------------
-// Commit a valid click.
-//
-// THIS IS THE ONLY PLACE validClicks is incremented.
-//
-// Therefore VALID can only appear when this function succeeds.
-// ------------------------------------------------------------
-
-func commitClick(reqID uint64) (bool, int) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Final protection against exceeding 40.
-	if validClicks >= validClickLimit {
-		log.Printf(
-			"REJECT req=%d reason=limit-reached-before-count completed=%d validating=%d",
-			reqID,
-			validClicks,
-			reservedClicks,
-		)
-
-		return false, 0
-	}
-
-	if reservedClicks <= 0 {
-		log.Printf(
-			"ERROR req=%d reason=missing-reservation",
-			reqID,
-		)
-
-		return false, 0
-	}
-
-	reservedClicks--
-	validClicks++
-
-	clickNumber := validClicks
-
-	log.Printf(
-		"VALID req=%d click=%d/%d",
-		reqID,
-		clickNumber,
-		validClickLimit,
-	)
-
-	return true, clickNumber
-}
-
-// ------------------------------------------------------------
-// Serve the one-second validated page.
-// ------------------------------------------------------------
-
-func serveValidatedPage(
-	w http.ResponseWriter,
-	r *http.Request,
-	filePath string,
-) {
-	reqID := requestID.Add(1)
+func handler(w http.ResponseWriter, r *http.Request) {
+	reqID := atomic.AddInt64(&requestID, 1)
 
 	log.Printf(
 		"REQUEST req=%d method=%s path=%s",
@@ -464,295 +120,301 @@ func serveValidatedPage(
 		r.URL.Path,
 	)
 
-	// ------------------------------------------------------------
-	// FIRST: preserve the 40-click -> 204 behavior.
-	// ------------------------------------------------------------
-
-	mu.Lock()
-	limitAlreadyReached :=
-		validClicks+reservedClicks >= validClickLimit
-	mu.Unlock()
-
-	if limitAlreadyReached {
-		log.Printf(
-			"REJECT req=%d reason=click-limit",
-			reqID,
-		)
-
+	// Only GET /
+	if r.Method != http.MethodGet || r.URL.Path != "/" {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	// ------------------------------------------------------------
-	// COOKIE BOOTSTRAP
+	// 1. COOKIE BOOTSTRAP
+	//
+	// The very first GET / receives a cookie and a 307.
+	// It does NOT receive index.html.
 	// ------------------------------------------------------------
 
-	clientID, hasCookie := getClientID(r)
+	cookie, err := r.Cookie("click_client")
 
-	if !hasCookie {
-		// This request is ONLY for establishing the client ID.
-		//
-		// It does NOT validate.
-		// It does NOT reserve a click.
-		// It does NOT serve index.html.
-		//
-		// Browser receives:
-		//
-		//   Set-Cookie
-		//   307 Location: /
-		//
-		// and automatically makes GET / again.
-		bootstrapClient(w, r, reqID)
+	if err != nil || cookie.Value == "" {
+		clientID := newClientID()
+
+		secure := r.TLS != nil ||
+			strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "click_client",
+			Value:    clientID,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   secure,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   86400,
+		})
+
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Location", "/")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+
+		log.Printf(
+			"BOOTSTRAP req=%d cookie-issued client=%s",
+			reqID,
+			clientID,
+		)
 
 		return
 	}
+
+	clientID := cookie.Value
 
 	log.Printf(
 		"COOKIE req=%d client=%s",
 		reqID,
-		shortID(clientID),
+		clientID,
 	)
 
-	clientState := getClientState(clientID)
+	state := getClientState(clientID)
 
 	// ------------------------------------------------------------
-	// CLIENT-LEVEL DUPLICATE PROTECTION.
+	// 2. PREVENT A RAPID RETRY AFTER A FAILED/DISCONNECTED REQUEST
+	//
+	// IMPORTANT:
+	// We do NOT reject recently-successful requests.
 	// ------------------------------------------------------------
 
-	ok, reason := beginValidation(clientState)
+	state.mu.Lock()
 
-	if !ok {
+	if state.inFlight {
+		state.mu.Unlock()
+
 		log.Printf(
-			"REJECT req=%d client=%s reason=%s",
+			"REJECT req=%d client=%s reason=validation-already-in-flight",
 			reqID,
-			shortID(clientID),
-			reason,
+			clientID,
 		)
 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	completed := false
-	reservationHeld := false
+	if !state.lastFailed.IsZero() &&
+		time.Since(state.lastFailed) < duplicateWindow {
 
-	// ------------------------------------------------------------
-	// Cleanup.
-	// ------------------------------------------------------------
+		state.mu.Unlock()
 
-	defer func() {
-		// Record success/failure on the cookie-based client state.
-		finishValidation(
-			clientState,
-			completed,
+		log.Printf(
+			"REJECT req=%d client=%s reason=recently-failed",
+			reqID,
+			clientID,
 		)
 
-		// Return a global reservation if this click never became
-		// valid.
-		if !completed && reservationHeld {
-			releaseReservation(
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	state.inFlight = true
+	state.mu.Unlock()
+
+	validationSucceeded := false
+
+	defer func() {
+		state.mu.Lock()
+
+		state.inFlight = false
+
+		if !validationSucceeded {
+			state.lastFailed = time.Now()
+		}
+
+		state.mu.Unlock()
+
+		if !validationSucceeded {
+			log.Printf(
+				"RELEASED req=%d reason=validation-failed",
 				reqID,
-				"validation-failed",
 			)
 		}
 	}()
 
 	// ------------------------------------------------------------
-	// GLOBAL VALIDATION CONCURRENCY LIMIT.
+	// 3. RESERVE A GLOBAL CLICK SLOT
 	// ------------------------------------------------------------
 
-	select {
-	case validationSemaphore <- struct{}{}:
-		defer func() {
-			<-validationSemaphore
-		}()
-
-	default:
+	if !reserveClick() {
 		log.Printf(
-			"REJECT req=%d reason=validation-capacity",
+			"REJECT req=%d client=%s reason=click-limit",
 			reqID,
+			clientID,
 		)
 
-		return
-	}
-
-	// ------------------------------------------------------------
-	// RESERVE ONE OF THE 40 CLICK SLOTS.
-	// ------------------------------------------------------------
-
-	if !reserveClick(reqID) {
-		// Important:
-		// The user receives 204 when the limit has been reached.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	reservationHeld = true
+	reservationHeld := true
+
+	defer func() {
+		if reservationHeld {
+			releaseReservation()
+		}
+	}()
+
+	log.Printf(
+		"RESERVED req=%d completed=%d validating=%d",
+		reqID,
+		atomic.LoadInt64(&validClicks),
+		atomic.LoadInt64(&reservedClicks),
+	)
 
 	// ------------------------------------------------------------
-	// ONE-SECOND VALIDATION.
+	// 4. LIMIT CONCURRENT VALIDATIONS
+	// ------------------------------------------------------------
+
+	select {
+	case waitSlots <- struct{}{}:
+		defer func() {
+			<-waitSlots
+		}()
+
+	case <-r.Context().Done():
+		log.Printf(
+			"REJECT req=%d client=%s reason=disconnect-before-validation",
+			reqID,
+			clientID,
+		)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 5. ONE-SECOND VALIDATION
 	// ------------------------------------------------------------
 
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
+	case <-timer.C:
+		// Validation time completed.
+
 	case <-r.Context().Done():
 		log.Printf(
 			"REJECT req=%d client=%s reason=disconnect-during-validation",
 			reqID,
-			shortID(clientID),
+			clientID,
 		)
-
 		return
-
-	case <-timer.C:
 	}
 
-	// ------------------------------------------------------------
-	// The full one second has elapsed.
-	//
-	// Check whether the request was cancelled.
-	// ------------------------------------------------------------
-
+	// Check again after the timer fires.
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d client=%s reason=disconnect-after-validation err=%v",
+			"REJECT req=%d client=%s reason=disconnect-after-validation",
 			reqID,
-			shortID(clientID),
-			err,
+			clientID,
 		)
-
 		return
 	}
 
 	// ------------------------------------------------------------
-	// READ INDEX.HTML.
+	// 6. READ INDEX
 	// ------------------------------------------------------------
 
-	page, err := os.ReadFile(filePath)
-	if err != nil {
+	if page == nil {
 		log.Printf(
-			"ERROR req=%d reason=read-index err=%v",
+			"REJECT req=%d client=%s reason=index-not-loaded",
 			reqID,
-			err,
-		)
-
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	// ------------------------------------------------------------
-	// CHECK AGAIN BEFORE RESPONSE.
-	// ------------------------------------------------------------
-
-	if err := r.Context().Err(); err != nil {
-		log.Printf(
-			"REJECT req=%d client=%s reason=disconnect-before-response",
-			reqID,
-			shortID(clientID),
+			clientID,
 		)
 
 		return
 	}
 
 	// ------------------------------------------------------------
-	// RESPONSE HEADERS.
-	// ------------------------------------------------------------
-
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set(
-		"Content-Type",
-		"text/html; charset=utf-8",
-	)
-	w.Header().Set(
-		"X-Content-Type-Options",
-		"nosniff",
-	)
-
-	// ------------------------------------------------------------
-	// SERVE PAGE.
+	// 7. COMMIT THE CLICK BEFORE SENDING THE PAGE
 	//
-	// This does NOT happen until the full one-second validation
-	// has completed.
+	// This makes the 40/10 limit authoritative before a 200 is sent.
 	// ------------------------------------------------------------
 
-	w.WriteHeader(http.StatusOK)
-
-	if _, err := w.Write(page); err != nil {
-		log.Printf(
-			"REJECT req=%d client=%s reason=response-write-failed err=%v",
-			reqID,
-			shortID(clientID),
-			err,
-		)
-
-		return
-	}
-
-	// ------------------------------------------------------------
-	// FLUSH RESPONSE.
-	// ------------------------------------------------------------
-
-	rc := http.NewResponseController(w)
-
-	if err := rc.Flush(); err != nil {
-		log.Printf(
-			"REJECT req=%d client=%s reason=response-flush-failed err=%v",
-			reqID,
-			shortID(clientID),
-			err,
-		)
-
-		return
-	}
-
-	// ------------------------------------------------------------
-	// FINAL CANCELLATION CHECK.
-	// ------------------------------------------------------------
-
-	if err := r.Context().Err(); err != nil {
-		log.Printf(
-			"REJECT req=%d client=%s reason=disconnect-after-response",
-			reqID,
-			shortID(clientID),
-		)
-
-		return
-	}
-
-	// ------------------------------------------------------------
-	// FINAL COMMIT.
-	//
-	// VALID can ONLY be generated by commitClick().
-	// ------------------------------------------------------------
-
-	ok, clickNumber := commitClick(reqID)
+	clickNumber, ok := commitClick()
 
 	if !ok {
-		// The global limit won the race.
-		//
-		// Preserve your 204 behavior.
+		reservationHeld = false
+
+		log.Printf(
+			"REJECT req=%d client=%s reason=click-limit",
+			reqID,
+			clientID,
+		)
+
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// The reservation has now been consumed.
 	reservationHeld = false
+	validationSucceeded = true
 
-	// Mark this request successful.
-	completed = true
+	log.Printf(
+		"VALID req=%d click=%d/%d",
+		reqID,
+		clickNumber,
+		validClickLimit,
+	)
+
+	// ------------------------------------------------------------
+	// 8. SEND INDEX.HTML
+	// ------------------------------------------------------------
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if _, err := w.Write(page); err != nil {
+		log.Printf(
+			"WRITE-ERROR req=%d client=%s err=%v",
+			reqID,
+			clientID,
+			err,
+		)
+
+		return
+	}
 
 	log.Printf(
 		"COMPLETED req=%d client=%s click=%d/%d",
 		reqID,
-		shortID(clientID),
+		clientID,
 		clickNumber,
 		validClickLimit,
 	)
+}
+
+// ---------- Main ----------
+
+func main() {
+	var err error
+
+	page, err = os.ReadFile("public/index.html")
+	if err != nil {
+		log.Fatalf("failed to read public/index.html: %v", err)
+	}
+
+	http.HandleFunc("/", handler)
+
+	server := &http.Server{
+		Addr: ":8080",
+
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return ctx
+		},
+	}
+
+	log.Printf(
+		"server listening on %s clickLimit=%d validation=%s",
+		server.Addr,
+		validClickLimit,
+		validationTime,
+	)
+
+	if err := server.ListenAndServe(); err != nil &&
+		err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
