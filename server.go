@@ -13,16 +13,16 @@ import (
 )
 
 const (
-	validationTime    = 1 * time.Second
-	validClickLimit   = 10 
+	validationTime     = 1 * time.Second
+	validClickLimit    = 10
 	maxConcurrentWaits = 50
-	duplicateWindow   = 1500 * time.Millisecond
+	duplicateWindow    = 1500 * time.Millisecond
 )
 
 var (
-	validClicks  int64
+	validClicks    int64
 	reservedClicks int64
-	requestID    int64
+	requestID      int64
 
 	waitSlots = make(chan struct{}, maxConcurrentWaits)
 
@@ -33,17 +33,18 @@ var (
 )
 
 type clientState struct {
-	mu         sync.Mutex
-	inFlight   bool
-	lastFailed time.Time
+	mu          sync.Mutex
+	inFlight    bool
+	lastFailed  time.Time
+	lastSuccess time.Time
 }
 
 // ---------- Client cookie ----------
 
 func newClientID() string {
 	b := make([]byte, 16)
+
 	if _, err := rand.Read(b); err != nil {
-		// Extremely unlikely, but don't continue with a predictable ID.
 		panic(err)
 	}
 
@@ -70,7 +71,7 @@ func reserveClick() bool {
 		completed := atomic.LoadInt64(&validClicks)
 		reserved := atomic.LoadInt64(&reservedClicks)
 
-		if completed+reserved >= validClickLimit {
+		if completed+reserved >= int64(validClickLimit) {
 			return false
 		}
 
@@ -89,12 +90,10 @@ func releaseReservation() {
 }
 
 func commitClick() (int64, bool) {
-	atomic.AddInt64(&reservedClicks, -1)
-
 	for {
 		current := atomic.LoadInt64(&validClicks)
 
-		if current >= validClickLimit {
+		if current >= int64(validClickLimit) {
 			return current, false
 		}
 
@@ -103,6 +102,7 @@ func commitClick() (int64, bool) {
 			current,
 			current+1,
 		) {
+			atomic.AddInt64(&reservedClicks, -1)
 			return current + 1, true
 		}
 	}
@@ -129,7 +129,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// ------------------------------------------------------------
 	// 1. COOKIE BOOTSTRAP
 	//
-	// The very first GET / receives a cookie and a 307.
+	// First GET / gets a cookie + 307.
 	// It does NOT receive index.html.
 	// ------------------------------------------------------------
 
@@ -139,7 +139,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		clientID := newClientID()
 
 		secure := r.TLS != nil ||
-			strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+			strings.EqualFold(
+				r.Header.Get("X-Forwarded-Proto"),
+				"https",
+			)
 
 		http.SetCookie(w, &http.Cookie{
 			Name:     "click_client",
@@ -175,10 +178,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	state := getClientState(clientID)
 
 	// ------------------------------------------------------------
-	// 2. PREVENT A RAPID RETRY AFTER A FAILED/DISCONNECTED REQUEST
-	//
-	// IMPORTANT:
-	// We do NOT reject recently-successful requests.
+	// 2. PREVENT DUPLICATES
 	// ------------------------------------------------------------
 
 	state.mu.Lock()
@@ -188,6 +188,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf(
 			"REJECT req=%d client=%s reason=validation-already-in-flight",
+			reqID,
+			clientID,
+		)
+
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if !state.lastSuccess.IsZero() &&
+		time.Since(state.lastSuccess) < duplicateWindow {
+
+		state.mu.Unlock()
+
+		log.Printf(
+			"REJECT req=%d client=%s reason=recently-succeeded",
 			reqID,
 			clientID,
 		)
@@ -221,7 +236,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		state.inFlight = false
 
-		if !validationSucceeded {
+		if validationSucceeded {
+			state.lastSuccess = time.Now()
+			state.lastFailed = time.Time{}
+		} else {
 			state.lastFailed = time.Now()
 		}
 
@@ -236,7 +254,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// ------------------------------------------------------------
-	// 3. RESERVE A GLOBAL CLICK SLOT
+	// 3. RESERVE GLOBAL CLICK SLOT
 	// ------------------------------------------------------------
 
 	if !reserveClick() {
@@ -293,7 +311,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case <-timer.C:
-		// Validation time completed.
+		// One second completed.
 
 	case <-r.Context().Done():
 		log.Printf(
@@ -304,7 +322,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check again after the timer fires.
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
 			"REJECT req=%d client=%s reason=disconnect-after-validation",
@@ -324,14 +341,44 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			reqID,
 			clientID,
 		)
-
 		return
 	}
 
 	// ------------------------------------------------------------
-	// 7. COMMIT THE CLICK BEFORE SENDING THE PAGE
+	// 7. SEND PAGE
 	//
-	// This makes the 40/10 limit authoritative before a 200 is sent.
+	// The click is not committed until after the page has been
+	// written/flushed and the request is still connected.
+	// ------------------------------------------------------------
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if _, err := w.Write(page); err != nil {
+		log.Printf(
+			"WRITE-ERROR req=%d client=%s err=%v",
+			reqID,
+			clientID,
+			err,
+		)
+		return
+	}
+
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	if err := r.Context().Err(); err != nil {
+		log.Printf(
+			"REJECT req=%d client=%s reason=disconnect-after-write",
+			reqID,
+			clientID,
+		)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// 8. COMMIT CLICK
 	// ------------------------------------------------------------
 
 	clickNumber, ok := commitClick()
@@ -345,7 +392,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			clientID,
 		)
 
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -358,24 +404,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		clickNumber,
 		validClickLimit,
 	)
-
-	// ------------------------------------------------------------
-	// 8. SEND INDEX.HTML
-	// ------------------------------------------------------------
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-
-	if _, err := w.Write(page); err != nil {
-		log.Printf(
-			"WRITE-ERROR req=%d client=%s err=%v",
-			reqID,
-			clientID,
-			err,
-		)
-
-		return
-	}
 
 	log.Printf(
 		"COMPLETED req=%d client=%s click=%d/%d",
@@ -393,17 +421,16 @@ func main() {
 
 	page, err = os.ReadFile("public/index.html")
 	if err != nil {
-		log.Fatalf("failed to read public/index.html: %v", err)
+		log.Fatalf(
+			"failed to read public/index.html: %v",
+			err,
+		)
 	}
 
 	http.HandleFunc("/", handler)
 
 	server := &http.Server{
 		Addr: ":8080",
-
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return ctx
-		},
 	}
 
 	log.Printf(
