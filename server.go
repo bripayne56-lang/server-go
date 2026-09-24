@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -16,72 +13,53 @@ import (
 )
 
 const (
-	// How long a click must remain alive before it is eligible
-	// for completion.
+	// How long validation must last.
 	validationTime = 1 * time.Second
 
 	// Maximum number of valid clicks during this server process.
-	validClickLimit = 10
+	validClickLimit = 40
 
 	// Maximum number of validations happening at once.
 	maxConcurrentWaits = 50
 
-	// After a successful click, reject another click from the
-	// same persistent connection during this window.
-	duplicateWindow = 1500 * time.Millisecond
-
-	// How long the browser has to ACK a successfully validated click.
+	// Suppress an immediate follow-up GET / on the same
+	// persistent HTTP connection after a successful click.
 	//
-	// If the browser disconnects before sending the ACK, the click
-	// is never counted.
-	ackTimeout = 5 * time.Second
+	// This is NOT IP rate limiting.
+	duplicateWindow = 1500 * time.Millisecond
 )
 
 // Every persistent HTTP connection gets its own state.
-//
 // No IP address is stored or examined.
 type connectionState struct {
 	mu sync.Mutex
 
-	// A validation is currently running on this connection.
-	validationInFlight bool
+	// True while a validation is currently running on this
+	// connection.
+	//
+	// This is the important duplicate protection. It prevents
+	// multiple requests arriving on the same connection from
+	// all running their own one-second validation at the same time.
+	inFlight bool
 
-	// Validation finished, but the browser has not acknowledged
-	// the success yet.
-	awaitingAck bool
-
-	// When the last successfully acknowledged click on this
-	// connection was completed.
+	// When the last successful click on this connection
+	// was completed.
 	lastValid time.Time
 }
 
 type connectionStateKey struct{}
 
-type pendingClick struct {
-	state     *connectionState
-	createdAt time.Time
-}
-
-type ackRequest struct {
-	Token string `json:"token"`
-}
-
 var (
-	// Protects validClicks and reservedClicks.
 	mu sync.Mutex
 
-	// Successfully acknowledged valid clicks.
+	// Successfully completed valid clicks.
 	validClicks int
 
-	// Clicks currently reserved while validating or awaiting ACK.
+	// Clicks currently being validated.
 	reservedClicks int
 
 	// Limits simultaneous validations.
 	validationSemaphore = make(chan struct{}, maxConcurrentWaits)
-
-	// Pending successful validations waiting for browser ACK.
-	pendingMu sync.Mutex
-	pending   = make(map[string]*pendingClick)
 
 	requestID atomic.Uint64
 )
@@ -94,67 +72,10 @@ func main() {
 
 	filePath := filepath.Join("public", "index.html")
 
-	mux := http.NewServeMux()
-
-	// ------------------------------------------------------------
-	// GET /
-	//
-	// This ONLY serves the page.
-	//
-	// It is NOT counted as a click.
-	// ------------------------------------------------------------
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		serveIndex(w, filePath)
-	})
-
-	// ------------------------------------------------------------
-	// POST /click
-	//
-	// This is the actual click validation request.
-	//
-	// It waits one second. If the request disappears before then,
-	// nothing is counted and no VALID log is emitted.
-	//
-	// If validation survives one second, the server sends a token.
-	// The click is STILL NOT COUNTED.
-	//
-	// It only becomes valid after POST /click/ack is received.
-	// ------------------------------------------------------------
-	mux.HandleFunc("/click", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/click" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		handleClick(w, r)
-	})
-
-	// ------------------------------------------------------------
-	// POST /click/ack
-	//
-	// The browser sends this only after it actually receives the
-	// successful one-second validation response.
-	//
-	// ONLY HERE can validClicks be incremented.
-	// ------------------------------------------------------------
-	mux.HandleFunc("/click/ack", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/click/ack" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		handleAck(w, r)
-	})
-
 	server := &http.Server{
 		Addr: ":" + port,
 
-		// Give each persistent HTTP connection its own state.
+		// Assign state to each TCP connection.
 		//
 		// No IP address is used.
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
@@ -168,57 +89,21 @@ func main() {
 		},
 	}
 
+	// Only GET / can enter validation.
+	// Every other path returns 204 and does not count.
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		serveValidatedPage(w, r, filePath)
+	})
+
 	log.Println("Server running on port", port)
 
 	log.Fatal(server.ListenAndServe())
 }
-
-// ------------------------------------------------------------
-// Serve index.html.
-// ------------------------------------------------------------
-
-func serveIndex(w http.ResponseWriter, filePath string) {
-	page, err := os.ReadFile(filePath)
-	if err != nil {
-		log.Printf("ERROR reason=read-index err=%v", err)
-
-		http.Error(
-			w,
-			"internal server error",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set(
-		"Content-Type",
-		"text/html; charset=utf-8",
-	)
-	w.Header().Set(
-		"X-Content-Type-Options",
-		"nosniff",
-	)
-
-	w.WriteHeader(http.StatusOK)
-
-	if _, err := w.Write(page); err != nil {
-		log.Printf(
-			"ERROR reason=index-write err=%v",
-			err,
-		)
-	}
-}
-
-// ------------------------------------------------------------
-// Connection state.
-// ------------------------------------------------------------
 
 func getConnectionState(r *http.Request) *connectionState {
 	state, ok := r.Context().
@@ -226,29 +111,30 @@ func getConnectionState(r *http.Request) *connectionState {
 		(*connectionState)
 
 	if !ok {
+		// ConnContext should always provide this.
+		// Return a private fallback rather than panic.
 		return &connectionState{}
 	}
 
 	return state
 }
 
-// beginClick atomically claims the connection for a new click.
+// beginValidation atomically claims this connection.
 //
-// It rejects:
-//   - another validation currently running
-//   - a validation waiting for ACK
-//   - a recent successful click
-func beginClick(state *connectionState) bool {
+// It rejects the request when:
+//   1. Another request is already being validated on this connection.
+//   2. A successful click just completed on this connection.
+//
+// This closes the race in the original code where several
+// requests could all see lastValid as empty and all start
+// validation simultaneously.
+func beginValidation(state *connectionState) bool {
 	now := time.Now()
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	if state.validationInFlight {
-		return false
-	}
-
-	if state.awaitingAck {
+	if state.inFlight {
 		return false
 	}
 
@@ -257,227 +143,51 @@ func beginClick(state *connectionState) bool {
 		return false
 	}
 
-	state.validationInFlight = true
+	state.inFlight = true
 
 	return true
 }
 
-// validationFailed releases the per-connection validation state.
-func validationFailed(state *connectionState) {
-	state.mu.Lock()
-	state.validationInFlight = false
-	state.mu.Unlock()
-}
-
-// validationSucceeded changes the connection into the
-// "waiting for ACK" state.
+// finishValidation releases the connection.
 //
-// The global reservation remains held.
-func validationSucceeded(state *connectionState) {
+// If successful is true, record the time of the successful click.
+func finishValidation(state *connectionState, successful bool) {
 	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	state.validationInFlight = false
-	state.awaitingAck = true
+	state.inFlight = false
 
-	state.mu.Unlock()
-}
-
-// completeAcknowledgedClick records a successful click on the
-// connection.
-func completeAcknowledgedClick(state *connectionState) {
-	state.mu.Lock()
-
-	state.awaitingAck = false
-	state.lastValid = time.Now()
-
-	state.mu.Unlock()
-}
-
-// expirePendingConnection releases the connection state when
-// an ACK never arrives.
-func expirePendingConnection(state *connectionState) {
-	state.mu.Lock()
-
-	state.awaitingAck = false
-
-	state.mu.Unlock()
-}
-
-// ------------------------------------------------------------
-// Global click reservation.
-// ------------------------------------------------------------
-
-// reserveClick reserves one of the 40 available lifetime slots.
-//
-// A reservation prevents several simultaneous validations from
-// consuming the final slots at the same time.
-func reserveClick(reqID uint64) bool {
-	mu.Lock()
-	defer mu.Unlock()
-
-	// IMPORTANT:
-	//
-	// Once 40 clicks are either completed OR reserved, return 204.
-	if validClicks+reservedClicks >= validClickLimit {
-		log.Printf(
-			"REJECT req=%d reason=click-limit completed=%d validating=%d",
-			reqID,
-			validClicks,
-			reservedClicks,
-		)
-
-		return false
+	if successful {
+		state.lastValid = time.Now()
 	}
-
-	reservedClicks++
-
-	log.Printf(
-		"RESERVED req=%d completed=%d validating=%d",
-		reqID,
-		validClicks,
-		reservedClicks,
-	)
-
-	return true
 }
 
-// releaseClickReservation releases a slot because the click
-// failed validation or never received an ACK.
-func releaseClickReservation(reqID uint64, reason string) {
-	mu.Lock()
-
-	if reservedClicks > 0 {
-		reservedClicks--
-	}
-
-	mu.Unlock()
-
-	log.Printf(
-		"RELEASED req=%d reason=%s",
-		reqID,
-		reason,
-	)
-}
-
-// ------------------------------------------------------------
-// Commit.
-//
-// THIS IS THE ONLY FUNCTION THAT PRODUCES A VALID CLICK.
-// ------------------------------------------------------------
-
-func commitAcknowledgedClick(reqID uint64) (bool, int) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	// If 40 valid clicks have already been committed, do not
-	// increment again.
-	if validClicks >= validClickLimit {
-		log.Printf(
-			"REJECT req=%d reason=limit-reached-before-count completed=%d validating=%d",
-			reqID,
-			validClicks,
-			reservedClicks,
-		)
-
-		return false, 0
-	}
-
-	if reservedClicks <= 0 {
-		log.Printf(
-			"ERROR req=%d reason=missing-reservation",
-			reqID,
-		)
-
-		return false, 0
-	}
-
-	// Reservation -> completed valid click.
-	reservedClicks--
-	validClicks++
-
-	clickNumber := validClicks
-
-	// IMPORTANT:
-	//
-	// VALID is logged only here.
-	//
-	// Therefore:
-	//
-	//   timer completed
-	//   AND browser received token
-	//   AND browser sent ACK
-	//   AND click was still available
-	//
-	// must all happen before VALID can appear.
-	log.Printf(
-		"VALID req=%d click=%d/%d",
-		reqID,
-		clickNumber,
-		validClickLimit,
-	)
-
-	return true, clickNumber
-}
-
-// ------------------------------------------------------------
-// Generate a cryptographically random click token.
-// ------------------------------------------------------------
-
-func newToken() (string, error) {
-	var b [32]byte
-
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(b[:]), nil
-}
-
-// ------------------------------------------------------------
-// Pending click storage.
-// ------------------------------------------------------------
-
-func addPending(token string, p *pendingClick) {
-	pendingMu.Lock()
-	pending[token] = p
-	pendingMu.Unlock()
-}
-
-func takePending(token string) (*pendingClick, bool) {
-	pendingMu.Lock()
-	defer pendingMu.Unlock()
-
-	p, ok := pending[token]
-	if !ok {
-		return nil, false
-	}
-
-	delete(pending, token)
-
-	return p, true
-}
-
-// ------------------------------------------------------------
-// POST /click
-// ------------------------------------------------------------
-
-func handleClick(
+// serveValidatedPage waits one second, verifies the request
+// remained alive, sends the page, flushes the response,
+// and only then commits the click.
+func serveValidatedPage(
 	w http.ResponseWriter,
 	r *http.Request,
+	filePath string,
 ) {
 	reqID := requestID.Add(1)
-	state := getConnectionState(r)
+	connState := getConnectionState(r)
 
 	log.Printf(
-		"CLICK req=%d",
+		"REQUEST req=%d method=%s path=%s",
 		reqID,
+		r.Method,
+		r.URL.Path,
 	)
 
 	// ------------------------------------------------------------
-	// Reject another click already running on this connection.
+	// Prevent multiple simultaneous validations on the same
+	// persistent connection.
 	// ------------------------------------------------------------
-
-	if !beginClick(state) {
+	//
+	// This must happen BEFORE starting the one-second timer.
+	// ------------------------------------------------------------
+	if !beginValidation(connState) {
 		log.Printf(
 			"REJECT req=%d reason=duplicate-or-in-flight",
 			reqID,
@@ -487,26 +197,31 @@ func handleClick(
 		return
 	}
 
-	validationStateFinished := false
+	completed := false
 	reservationHeld := false
 
+	// Always release the connection's inFlight state.
+	//
+	// If the click never became valid, also return its global
+	// reservation.
 	defer func() {
-		if !validationStateFinished {
-			validationFailed(state)
-		}
+		finishValidation(connState, completed)
 
-		if reservationHeld {
-			releaseClickReservation(
+		if !completed && reservationHeld {
+			mu.Lock()
+			reservedClicks--
+			mu.Unlock()
+
+			log.Printf(
+				"RELEASED req=%d reason=validation-failed",
 				reqID,
-				"validation-failed",
 			)
 		}
 	}()
 
 	// ------------------------------------------------------------
-	// Global concurrency limit.
+	// Limit simultaneous validations.
 	// ------------------------------------------------------------
-
 	select {
 	case validationSemaphore <- struct{}{}:
 		defer func() {
@@ -524,26 +239,49 @@ func handleClick(
 	}
 
 	// ------------------------------------------------------------
-	// Reserve a lifetime click slot.
+	// Reserve one of the 40 lifetime click slots.
 	// ------------------------------------------------------------
+	mu.Lock()
 
-	if !reserveClick(reqID) {
+	if validClicks+reservedClicks >= validClickLimit {
+		mu.Unlock()
+
+		log.Printf(
+			"REJECT req=%d reason=click-limit completed=%d validating=%d",
+			reqID,
+			validClicks,
+			reservedClicks,
+		)
+
+		// IMPORTANT:
+		// When the 40-click limit has been reached, this remains
+		// a 204 response.
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	reservedClicks++
 	reservationHeld = true
 
-	// ------------------------------------------------------------
-	// EXACT one-second validation.
-	// ------------------------------------------------------------
+	log.Printf(
+		"RESERVED req=%d completed=%d validating=%d",
+		reqID,
+		validClicks,
+		reservedClicks,
+	)
 
+	mu.Unlock()
+
+	// ------------------------------------------------------------
+	// One-second validation.
+	// ------------------------------------------------------------
 	timer := time.NewTimer(validationTime)
 	defer timer.Stop()
 
 	select {
 	case <-r.Context().Done():
 		log.Printf(
-			"REJECT req=%d reason=disconnect-before-one-second",
+			"REJECT req=%d reason=disconnect-during-validation",
 			reqID,
 		)
 
@@ -553,14 +291,13 @@ func handleClick(
 	}
 
 	// ------------------------------------------------------------
-	// Validation has now lasted a full second.
+	// The full one second has now elapsed.
 	//
-	// We STILL do not count anything yet.
+	// Do not count unless the request is still alive.
 	// ------------------------------------------------------------
-
 	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=disconnect-at-validation-end err=%v",
+			"REJECT req=%d reason=disconnect-after-validation err=%v",
 			reqID,
 			err,
 		)
@@ -569,13 +306,26 @@ func handleClick(
 	}
 
 	// ------------------------------------------------------------
-	// Create a one-time success token.
+	// Read index.html before consuming the reservation.
 	// ------------------------------------------------------------
-
-	token, err := newToken()
+	page, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Printf(
-			"ERROR req=%d reason=token-generation err=%v",
+			"ERROR req=%d reason=read-index err=%v",
+			reqID,
+			err,
+		)
+
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// ------------------------------------------------------------
+	// Check again before writing.
+	// ------------------------------------------------------------
+	if err := r.Context().Err(); err != nil {
+		log.Printf(
+			"REJECT req=%d reason=disconnect-before-response err=%v",
 			reqID,
 			err,
 		)
@@ -584,85 +334,8 @@ func handleClick(
 	}
 
 	// ------------------------------------------------------------
-	// Store the pending click BEFORE sending the token.
+	// Set response headers.
 	// ------------------------------------------------------------
-
-	p := &pendingClick{
-		state:     state,
-		createdAt: time.Now(),
-	}
-
-	addPending(token, p)
-
-	// The reservation is now owned by the pending click.
-	reservationHeld = false
-
-	validationSucceeded(state)
-	validationStateFinished = true
-
-	// ------------------------------------------------------------
-	// Expire the pending click if no ACK arrives.
-	// ------------------------------------------------------------
-
-	go func() {
-		timer := time.NewTimer(ackTimeout)
-		defer timer.Stop()
-
-		<-timer.C
-
-		pendingClick, ok := takePending(token)
-		if !ok {
-			// ACK already consumed it.
-			return
-		}
-
-		expirePendingConnection(pendingClick.state)
-
-		releaseClickReservation(
-			reqID,
-			"ack-timeout",
-		)
-
-		log.Printf(
-			"EXPIRED req=%d reason=ack-timeout",
-			reqID,
-		)
-	}()
-
-	// ------------------------------------------------------------
-	// Tell the browser that one second successfully passed.
-	//
-	// IMPORTANT:
-	// This is NOT VALID yet.
-	// ------------------------------------------------------------
-
-	response := struct {
-		Token string `json:"token"`
-	}{
-		Token: token,
-	}
-
-	body, err := json.Marshal(response)
-	if err != nil {
-		// Remove pending click and give reservation back.
-		_, _ = takePending(token)
-
-		expirePendingConnection(state)
-
-		releaseClickReservation(
-			reqID,
-			"json-encode-failed",
-		)
-
-		log.Printf(
-			"ERROR req=%d reason=json-encode err=%v",
-			reqID,
-			err,
-		)
-
-		return
-	}
-
 	w.Header().Set(
 		"Cache-Control",
 		"no-store, no-cache, must-revalidate, max-age=0",
@@ -671,25 +344,19 @@ func handleClick(
 	w.Header().Set("Expires", "0")
 	w.Header().Set(
 		"Content-Type",
-		"application/json; charset=utf-8",
+		"text/html; charset=utf-8",
+	)
+	w.Header().Set(
+		"X-Content-Type-Options",
+		"nosniff",
 	)
 
+	// ------------------------------------------------------------
+	// Send the page BEFORE counting the click.
+	// ------------------------------------------------------------
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := w.Write(body); err != nil {
-		// Browser did not successfully receive the response
-		// according to the server's write operation.
-		//
-		// No ACK is possible, so remove the pending click.
-		_, _ = takePending(token)
-
-		expirePendingConnection(state)
-
-		releaseClickReservation(
-			reqID,
-			"response-write-failed",
-		)
-
+	if _, err := w.Write(page); err != nil {
 		log.Printf(
 			"REJECT req=%d reason=response-write-failed err=%v",
 			reqID,
@@ -699,18 +366,12 @@ func handleClick(
 		return
 	}
 
+	// ------------------------------------------------------------
+	// Explicitly flush the response.
+	// ------------------------------------------------------------
 	rc := http.NewResponseController(w)
 
 	if err := rc.Flush(); err != nil {
-		_, _ = takePending(token)
-
-		expirePendingConnection(state)
-
-		releaseClickReservation(
-			reqID,
-			"response-flush-failed",
-		)
-
 		log.Printf(
 			"REJECT req=%d reason=response-flush-failed err=%v",
 			reqID,
@@ -720,139 +381,79 @@ func handleClick(
 		return
 	}
 
-	log.Printf(
-		"VALIDATION-PASSED req=%d waiting-for-ack",
-		reqID,
-	)
-
-	// IMPORTANT:
-	//
-	// There is intentionally NO "VALID" log here.
-	//
-	// There is intentionally NO increment here.
-	//
-	// The click is still only pending.
-}
-
-// ------------------------------------------------------------
-// POST /click/ack
-// ------------------------------------------------------------
-
-func handleAck(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	reqID := requestID.Add(1)
-
-	var req ackRequest
-
-	decoder := json.NewDecoder(r.Body)
-
-	if err := decoder.Decode(&req); err != nil {
+	// ------------------------------------------------------------
+	// Final request cancellation check.
+	// ------------------------------------------------------------
+	if err := r.Context().Err(); err != nil {
 		log.Printf(
-			"REJECT req=%d reason=invalid-ack",
-			reqID,
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Token == "" {
-		log.Printf(
-			"REJECT req=%d reason=empty-token",
-			reqID,
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	log.Printf(
-		"ACK req=%d token=%s",
-		reqID,
-		req.Token,
-	)
-
-	// ------------------------------------------------------------
-	// Atomically consume the token.
-	//
-	// This guarantees the same ACK cannot be counted twice.
-	// ------------------------------------------------------------
-
-	p, ok := takePending(req.Token)
-
-	if !ok {
-		log.Printf(
-			"REJECT req=%d reason=invalid-or-already-used-token",
-			reqID,
-		)
-
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// ------------------------------------------------------------
-	// Now and ONLY now does the click become valid.
-	// ------------------------------------------------------------
-
-	ok, clickNumber := commitAcknowledgedClick(reqID)
-
-	if !ok {
-		// The click could not be committed because the global
-		// limit has already been reached.
-		expirePendingConnection(p.state)
-
-		// IMPORTANT:
-		// 204 is preserved when the 40-click limit is reached.
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// ------------------------------------------------------------
-	// Update the connection's duplicate window.
-	// ------------------------------------------------------------
-
-	completeAcknowledgedClick(p.state)
-
-	response := struct {
-		Click int `json:"click"`
-		Limit int `json:"limit"`
-	}{
-		Click: clickNumber,
-		Limit: validClickLimit,
-	}
-
-	body, err := json.Marshal(response)
-	if err != nil {
-		// The click is already committed at this point.
-		// Do not attempt to decrement it.
-		http.Error(
-			w,
-			"internal server error",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	w.Header().Set(
-		"Cache-Control",
-		"no-store, no-cache, must-revalidate, max-age=0",
-	)
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.Header().Set(
-		"Content-Type",
-		"application/json; charset=utf-8",
-	)
-
-	w.WriteHeader(http.StatusOK)
-
-	if _, err := w.Write(body); err != nil {
-		log.Printf(
-			"INFO req=%d reason=ack-response-write-failed err=%v",
+			"REJECT req=%d reason=disconnect-after-response err=%v",
 			reqID,
 			err,
 		)
+
+		return
 	}
+
+	// ------------------------------------------------------------
+	// FINAL COMMIT
+	//
+	// VALID is only logged here.
+	//
+	// At this point:
+	//   - this connection had no other validation running
+	//   - the one-second timer completed
+	//   - the request was still alive after validation
+	//   - the file was read
+	//   - the response was written
+	//   - the response was flushed
+	//   - the request was still alive after the flush
+	// ------------------------------------------------------------
+	mu.Lock()
+
+	// Another validation could have consumed the final slot.
+	if validClicks >= validClickLimit {
+		mu.Unlock()
+
+		log.Printf(
+			"REJECT req=%d reason=limit-reached-before-count completed=%d validating=%d",
+			reqID,
+			validClicks,
+			reservedClicks,
+		)
+
+		return
+	}
+
+	// Final cancellation check while holding the click lock.
+	if err := r.Context().Err(); err != nil {
+		mu.Unlock()
+
+		log.Printf(
+			"REJECT req=%d reason=disconnect-before-increment",
+			reqID,
+		)
+
+		return
+	}
+
+	// Reservation -> completed click.
+	reservedClicks--
+	reservationHeld = false
+
+	validClicks++
+	clickNumber := validClicks
+
+	mu.Unlock()
+
+	// The click has now actually become valid.
+	completed = true
+
+	finishValidation(connState, true)
+
+	log.Printf(
+		"VALID req=%d click=%d/%d",
+		reqID,
+		clickNumber,
+		validClickLimit,
+	)
 }
