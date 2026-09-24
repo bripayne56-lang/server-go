@@ -45,13 +45,13 @@ const (
 type clientState struct {
 	mu sync.Mutex
 
-	// A GET / validation is currently running.
+	// Only one GET / validation can be active for this browser ID.
 	inFlight bool
 
 	// Last time this client completed a valid click.
 	lastValid time.Time
 
-	// A page was successfully served and is waiting for ACK.
+	// Exactly one page/attempt can be waiting for its ACK.
 	pendingToken string
 	pendingAt    time.Time
 }
@@ -62,9 +62,7 @@ var (
 	clientStates   = make(map[string]*clientState)
 
 	// Protects validClicks.
-	mu sync.Mutex
-
-	// ONLY acknowledged clicks are counted here.
+	clickMu     sync.Mutex
 	validClicks int
 
 	// Limits simultaneous one-second validations.
@@ -250,9 +248,9 @@ func getClientState(clientID string) *clientState {
 	clientStatesMu.Lock()
 	defer clientStatesMu.Unlock()
 
-	state, ok := clientStates[clientID]
+	state := clientStates[clientID]
 
-	if !ok {
+	if state == nil {
 		state = &clientState{}
 		clientStates[clientID] = state
 	}
@@ -261,17 +259,14 @@ func getClientState(clientID string) *clientState {
 }
 
 // ------------------------------------------------------------
-// Begin a validation.
+// Begin validation.
 //
-// IMPORTANT:
-// A previous FAILED request does NOT block this request.
+// A previous FAILED GET / does NOT block this request.
 //
-// Only:
-//   - another validation already running
-//   - a recent successful click
-//   - a page currently awaiting ACK
-//
-// can cause a rejection.
+// Only these can cause rejection:
+//   - another validation is already running
+//   - a page is currently waiting for ACK
+//   - this client just completed a valid click
 // ------------------------------------------------------------
 
 func beginValidation(state *clientState) (bool, string) {
@@ -280,12 +275,10 @@ func beginValidation(state *clientState) (bool, string) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	// Another GET / is already validating for this client.
 	if state.inFlight {
 		return false, "validation-already-in-flight"
 	}
 
-	// A page was already served and is waiting for its ACK.
 	if state.pendingToken != "" {
 		if now.Sub(state.pendingAt) < ackTimeout {
 			return false, "awaiting-acknowledgement"
@@ -296,7 +289,6 @@ func beginValidation(state *clientState) (bool, string) {
 		state.pendingAt = time.Time{}
 	}
 
-	// Recently completed valid click.
 	if !state.lastValid.IsZero() &&
 		now.Sub(state.lastValid) < duplicateWindow {
 		return false, "recently-succeeded"
@@ -308,22 +300,21 @@ func beginValidation(state *clientState) (bool, string) {
 }
 
 // ------------------------------------------------------------
-// Mark a validation as failed.
+// Mark a GET / validation as failed.
 //
-// There is intentionally NO lastFailed field.
+// There is intentionally NO "lastFailed" state.
 //
 // A failed GET / does not block a later GET /.
 // ------------------------------------------------------------
 
 func failValidation(state *clientState) {
 	state.mu.Lock()
-	defer state.mu.Unlock()
-
 	state.inFlight = false
+	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
-// Put a successfully served page into "awaiting ACK" state.
+// Put a successfully prepared page into "awaiting ACK" state.
 // ------------------------------------------------------------
 
 func setPendingAck(
@@ -331,11 +322,12 @@ func setPendingAck(
 	token string,
 ) {
 	state.mu.Lock()
-	defer state.mu.Unlock()
 
 	state.inFlight = false
 	state.pendingToken = token
 	state.pendingAt = time.Now()
+
+	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
@@ -344,17 +336,18 @@ func setPendingAck(
 
 func cancelPendingAck(state *clientState) {
 	state.mu.Lock()
-	defer state.mu.Unlock()
 
 	state.inFlight = false
 	state.pendingToken = ""
 	state.pendingAt = time.Time{}
+
+	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
 // Validate and consume the browser ACK token.
 //
-// Returns true ONLY for the exact pending token.
+// The token must exactly match the currently pending page.
 // ------------------------------------------------------------
 
 func acknowledge(
@@ -380,7 +373,7 @@ func acknowledge(
 		return false
 	}
 
-	// Consume token so it cannot be used twice.
+	// Consume token so it cannot be reused.
 	state.pendingToken = ""
 	state.pendingAt = time.Time{}
 
@@ -393,9 +386,8 @@ func acknowledge(
 
 func markClientSuccessful(state *clientState) {
 	state.mu.Lock()
-	defer state.mu.Unlock()
-
 	state.lastValid = time.Now()
+	state.mu.Unlock()
 }
 
 // ------------------------------------------------------------
@@ -403,12 +395,12 @@ func markClientSuccessful(state *clientState) {
 //
 // ONLY validClicks matters.
 //
-// In-flight GET / requests do NOT cause 204.
+// In-flight requests do NOT cause a 204.
 // ------------------------------------------------------------
 
 func limitReached() bool {
-	mu.Lock()
-	defer mu.Unlock()
+	clickMu.Lock()
+	defer clickMu.Unlock()
 
 	return validClicks >= validClickLimit
 }
@@ -418,8 +410,8 @@ func limitReached() bool {
 // ------------------------------------------------------------
 
 func validClickCount() int {
-	mu.Lock()
-	defer mu.Unlock()
+	clickMu.Lock()
+	defer clickMu.Unlock()
 
 	return validClicks
 }
@@ -429,13 +421,13 @@ func validClickCount() int {
 //
 // THIS IS THE ONLY PLACE validClicks IS INCREMENTED.
 //
-// A GET / can NEVER directly call this successfully.
+// GET / NEVER calls this directly.
 // Only /__click_ack reaches this function.
 // ------------------------------------------------------------
 
 func commitClick(reqID uint64) (bool, int) {
-	mu.Lock()
-	defer mu.Unlock()
+	clickMu.Lock()
+	defer clickMu.Unlock()
 
 	if validClicks >= validClickLimit {
 		log.Printf(
@@ -528,9 +520,20 @@ func injectAckScript(
 			len(page)+len(script),
 		)
 
-		out = append(out, page[:index]...)
-		out = append(out, script...)
-		out = append(out, page[index:]...)
+		out = append(
+			out,
+			page[:index]...,
+		)
+
+		out = append(
+			out,
+			script...,
+		)
+
+		out = append(
+			out,
+			page[index:]...,
+		)
 
 		return out
 	}
@@ -567,6 +570,7 @@ func handleAck(
 		r.URL.Path,
 	)
 
+	// Only POST acknowledgements are accepted.
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -629,7 +633,7 @@ func handleAck(
 		validClickLimit,
 	)
 
-	// ACK endpoint intentionally returns no content.
+	// ACK response intentionally returns no content.
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -664,7 +668,7 @@ func serveValidatedPage(
 	)
 
 	// --------------------------------------------------------
-	// 204 ONLY when the ACTUAL completed limit is reached.
+	// 204 ONLY when the actual completed lifetime limit is reached.
 	// --------------------------------------------------------
 
 	if limitReached() {
@@ -711,16 +715,16 @@ func serveValidatedPage(
 			reason,
 		)
 
-		// Duplicate/rejected requests return 204.
+		// Duplicate/rejected requests can return 204.
 		// They NEVER call commitClick().
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	validationFailed := true
+	validationActive := true
 
 	defer func() {
-		if validationFailed {
+		if validationActive {
 			failValidation(state)
 
 			log.Printf(
@@ -732,7 +736,7 @@ func serveValidatedPage(
 	}()
 
 	// --------------------------------------------------------
-	// VALIDATION CONCURRENCY LIMIT
+	// GLOBAL VALIDATION CONCURRENCY LIMIT
 	// --------------------------------------------------------
 
 	select {
@@ -767,6 +771,7 @@ func serveValidatedPage(
 			shortID(clientID),
 		)
 
+		// This request cannot count.
 		return
 
 	case <-timer.C:
@@ -847,7 +852,7 @@ func serveValidatedPage(
 	}
 
 	// --------------------------------------------------------
-	// Create unique ACK token.
+	// Create unique acknowledgement token.
 	// --------------------------------------------------------
 
 	token, err := newAttemptToken()
@@ -864,13 +869,17 @@ func serveValidatedPage(
 	}
 
 	// Inject ACK script into response.
+	//
+	// The original public/index.html file is NOT modified.
 	page = injectAckScript(page, token)
 
 	// --------------------------------------------------------
-	// Register pending ACK BEFORE sending page.
+	// Register token BEFORE sending page.
 	// --------------------------------------------------------
 
 	setPendingAck(state, token)
+
+	validationActive = false
 
 	// --------------------------------------------------------
 	// RESPONSE HEADERS
@@ -911,9 +920,7 @@ func serveValidatedPage(
 	// FLUSH RESPONSE.
 	// --------------------------------------------------------
 
-	rc := http.NewResponseController(w)
-
-	if err := rc.Flush(); err != nil {
+	if err := http.NewResponseController(w).Flush(); err != nil {
 		cancelPendingAck(state)
 
 		log.Printf(
@@ -927,14 +934,12 @@ func serveValidatedPage(
 	}
 
 	// --------------------------------------------------------
-	// GET / is done.
+	// GET / is finished.
 	//
 	// It is NOT valid yet.
 	//
 	// It is waiting for /__click_ack.
 	// --------------------------------------------------------
-
-	validationFailed = false
 
 	log.Printf(
 		"PAGE-SENT req=%d client=%s awaiting-ack",
